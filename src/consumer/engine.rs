@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -61,6 +61,12 @@ pub struct ConsumerEngine<Exe: Executor> {
     window: u32,
     unacked_message_redelivery_delay: Option<Duration>,
     unacked_messages: HashMap<MessageIdData, Instant>,
+    /// Members acked so far of batch entries not yet acked as a whole, by
+    /// (ledger, entry).
+    batch_acks: BTreeMap<(u64, u64), BatchAcks>,
+    /// Permits of the frame being processed that are accounted for, by a
+    /// delivery or a refund, so a failure refunds only the rest.
+    frame_accounted: u32,
     dead_letter_policy: Option<DeadLetterPolicy>,
     options: ConsumerOptions,
 }
@@ -106,6 +112,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             window,
             unacked_message_redelivery_delay,
             unacked_messages: HashMap::new(),
+            batch_acks: BTreeMap::new(),
+            frame_accounted: 0,
             dead_letter_policy,
             options,
         }
@@ -214,6 +222,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     .and_then(|payload| payload.metadata.num_messages_in_batch)
                     .unwrap_or(1)
                     .max(1) as u32;
+                self.frame_accounted = 0;
                 match self.process_message(message).await {
                     // Continue
                     Ok(true) => None,
@@ -222,7 +231,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     Err(e) => {
                         // the broker charged permits the application never
                         // gets messages for
-                        self.refund_permits(charged).await;
+                        let rest = charged.saturating_sub(self.frame_accounted);
+                        self.refund_permits(rest).await;
                         self.deliver(Err(e)).err().map(Err)
                     }
                 }
@@ -309,17 +319,73 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn ack(&mut self, message_id: MessageIdData, cumulative: bool) {
-        // FIXME: this does not handle cumulative acks
         self.track_taken();
-        self.unacked_messages.remove(&message_id);
+        let tracked = MessageIdData {
+            batch_size: None,
+            ..message_id.clone()
+        };
+        if cumulative {
+            let acked = position(&tracked);
+            self.unacked_messages.retain(|id, _| position(id) > acked);
+        } else {
+            self.unacked_messages.remove(&tracked);
+        }
+        let Some(target) = self.ack_target(message_id, cumulative) else {
+            return;
+        };
         let res = self
             .connection
             .sender()
-            .send_ack(self.id, vec![message_id], cumulative)
+            .send_ack(self.id, vec![target], cumulative)
             .await;
         if res.is_err() {
             error!("ack error: {:?}", res);
         }
+    }
+
+    /// What to send the broker for an ack of `id`. An ack of a batch member
+    /// would acknowledge the whole entry, so an individual ack waits until
+    /// every member is acked, and a cumulative ack in the middle of a batch
+    /// covers only the entry before it; the rest of that batch then comes
+    /// again after a restart. An id without a batch size is sent as it is.
+    // Java: PersistentAcknowledgmentsGroupingTracker.java:248 (cumulative),
+    // MessageIdAdvUtils.acknowledge and prevMessageId
+    fn ack_target(&mut self, id: MessageIdData, cumulative: bool) -> Option<MessageIdData> {
+        let key = (id.ledger_id, id.entry_id);
+        if cumulative {
+            // entries before this one are covered; this one keeps its marks
+            while let Some(entry) = self.batch_acks.first_entry() {
+                if *entry.key() >= key {
+                    break;
+                }
+                entry.remove();
+            }
+        }
+        let (Some(index), Some(size)) = (id.batch_index, id.batch_size) else {
+            return Some(id);
+        };
+        let acks = self
+            .batch_acks
+            .entry(key)
+            .or_insert_with(|| BatchAcks::new(size));
+        if cumulative {
+            acks.mark_up_to(index);
+        } else {
+            acks.mark(index);
+        }
+        if acks.is_complete() {
+            self.batch_acks.remove(&key);
+            return Some(whole_entry(id));
+        }
+        if !cumulative {
+            return None;
+        }
+        // Entry 0 has none before it in this ledger; Java sends (ledger, -1),
+        // which covers every earlier ledger.
+        Some(MessageIdData {
+            entry_id: id.entry_id.wrapping_sub(1),
+            ..whole_entry(id)
+        })
     }
 
     /// Process the message. Returns `true` if there are more messages to process
@@ -508,7 +574,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
         };
 
-        let payloads = if payload.metadata.num_messages_in_batch.is_some() {
+        let batch_size = payload.metadata.num_messages_in_batch;
+        let payloads = if batch_size.is_some() {
             BatchedMessageIterator::new(message.message_id, payload)?.collect()
         } else {
             vec![(message.message_id, payload)]
@@ -519,6 +586,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     debug!(
                         "consumer engine: dropped {message_id:?}, delivered before the reconnect"
                     );
+                    // the application never sees it, so it never acks it
+                    if let (Some(index), Some(size)) = (message_id.batch_index, batch_size) {
+                        self.batch_acks
+                            .entry((message_id.ledger_id, message_id.entry_id))
+                            .or_insert_with(|| BatchAcks::new(size))
+                            .mark(index);
+                    }
                     self.refund_permit().await;
                     continue;
                 }
@@ -577,7 +651,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                             Error::Custom("DLQ send error".to_string())
                         })?;
 
-                    self.ack(message_id, false).await;
+                    // with the batch size, so only this member counts as acked
+                    self.ack(
+                        MessageIdData {
+                            batch_size,
+                            ..message_id
+                        },
+                        false,
+                    )
+                    .await;
                     self.refund_permit().await;
                 }
                 _ => self.send_to_consumer(message_id, payload).await?,
@@ -646,6 +728,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
         }
         self.unacked_messages.clear();
+        // Java ties batch ack state to the delivered ids, which a reconnect
+        // delivers anew.
+        self.batch_acks.clear();
 
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
@@ -816,6 +901,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     }
 
     async fn refund_permits(&mut self, permits: u32) {
+        self.frame_accounted += permits;
+        if permits == 0 {
+            return;
+        }
         let flow = self.delivery.lock().unwrap().free_permits(permits);
         if let Some(permits) = flow {
             self.send_flow(permits).await;
@@ -862,8 +951,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
-    fn deliver(&self, item: Result<(u64, MessageIdData, Payload), Error>) -> Result<(), Error> {
+    fn deliver(&mut self, item: Result<(u64, MessageIdData, Payload), Error>) -> Result<(), Error> {
         if item.is_ok() {
+            self.frame_accounted += 1;
             self.delivery.lock().unwrap().queued += 1;
         }
         self.tx.unbounded_send(item).map_err(|_| {
@@ -911,6 +1001,67 @@ impl<Exe: Executor> std::ops::Drop for ConsumerEngine<Exe> {
             }
         }));
     }
+}
+
+/// The members of one batch entry not acked yet: a set bit is a member
+/// still unacked, as in the protocol's `ack_set`.
+struct BatchAcks {
+    unacked: Vec<u64>,
+}
+
+impl BatchAcks {
+    fn new(size: i32) -> Self {
+        let size = size.max(1) as usize;
+        let mut unacked = vec![u64::MAX; size.div_ceil(64)];
+        if !size.is_multiple_of(64) {
+            *unacked.last_mut().expect("at least one word") = (1u64 << (size % 64)) - 1;
+        }
+        BatchAcks { unacked }
+    }
+
+    fn mark(&mut self, member: i32) {
+        let Ok(member) = usize::try_from(member) else {
+            return;
+        };
+        if let Some(word) = self.unacked.get_mut(member / 64) {
+            *word &= !(1u64 << (member % 64));
+        }
+    }
+
+    fn mark_up_to(&mut self, member: i32) {
+        let Ok(member) = usize::try_from(member) else {
+            return;
+        };
+        let full_words = (member + 1) / 64;
+        for word in self.unacked.iter_mut().take(full_words) {
+            *word = 0;
+        }
+        let rest = (member + 1) % 64;
+        if rest != 0 {
+            if let Some(word) = self.unacked.get_mut(full_words) {
+                *word &= !((1u64 << rest) - 1);
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.unacked.iter().all(|&word| word == 0)
+    }
+}
+
+/// The id of the entry `id` is in, without its place in a batch.
+fn whole_entry(id: MessageIdData) -> MessageIdData {
+    MessageIdData {
+        batch_index: None,
+        batch_size: None,
+        ack_set: Vec::new(),
+        ..id
+    }
+}
+
+/// Where `id` sits in delivery order.
+fn position(id: &MessageIdData) -> (u64, u64, i32) {
+    (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1))
 }
 
 /// Whether `id` was already delivered when the subscription restarts from

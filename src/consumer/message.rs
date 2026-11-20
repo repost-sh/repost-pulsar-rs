@@ -44,6 +44,16 @@ impl<T> Message<T> {
         &self.message_id.id
     }
 
+    /// The id an ack of this message carries to the engine: with the size of
+    /// its batch, so the engine can tell whether an ack covers the whole entry.
+    // Java: BatchMessageIdImpl carries batchSize
+    pub(crate) fn ack_id(&self) -> MessageIdData {
+        MessageIdData {
+            batch_size: self.message_id.batch_size,
+            ..self.message_id.id.clone()
+        }
+    }
+
     /// Get message key (partition key string as stored in metadata)
     ///
     /// When [`has_base64_encoded_key`](Self::has_base64_encoded_key) is true, this is the

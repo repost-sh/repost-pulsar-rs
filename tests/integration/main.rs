@@ -8,6 +8,7 @@
 //! reuse it. `cluster.rs` shows how to remove it.
 
 mod acks;
+mod batch_acks;
 mod cluster;
 mod delivery;
 mod reconnect;

@@ -34,7 +34,10 @@ async fn an_unloaded_consumer_does_not_deliver_its_stale_buffer_again() {
     publish(&pulsar, &topic, 21..=25).await;
 
     collect(&mut consumer, &mut delivered, 25, DEADLINE).await;
-    delivered.assert_exactly(&topic, 1..=25);
+    // The broker may send 1 to 5 again: it saves ack positions at most once a
+    // second, and an unload right after the acks can lose the last of them.
+    // What the client buffered, 6 to 20, must come once.
+    delivered.assert_exactly_ignoring_earlier(&topic, 6..=25);
 }
 
 #[tokio::test]

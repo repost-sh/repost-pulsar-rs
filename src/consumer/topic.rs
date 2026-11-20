@@ -199,7 +199,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
-            .send(EngineMessage::Ack(msg.message_id().clone(), false))
+            .send(EngineMessage::Ack(msg.ack_id(), false))
             .await?;
         Ok(())
     }
@@ -220,7 +220,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
-            .send(EngineMessage::Ack(msg.message_id().clone(), true))
+            .send(EngineMessage::Ack(msg.ack_id(), true))
             .await?;
         Ok(())
     }
