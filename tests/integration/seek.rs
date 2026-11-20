@@ -179,3 +179,73 @@ async fn a_time_seek_after_an_id_seek_restarts_at_the_time() {
     collect(&mut consumer, &mut after, 10, DEADLINE).await;
     after.assert_exactly(&topic, 1..=10);
 }
+
+// Threads of their own for the engine and the test, so the application can
+// read between the seek's answer and the engine handling the broker's close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_message_from_before_a_seek_arrives_after_it() {
+    let cluster = exclusive().await;
+    let topic = topic("seek-floor");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &topic, 1..=300).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    let taken = take(&mut consumer, &mut Delivered::default(), 10).await;
+    // the rest of the backlog fills the receive queue
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter >= 300)
+        .await;
+
+    // Many seeks back, each with a full queue of messages from before it:
+    // the very next message must be the one after the target, every time.
+    for round in 0..20 {
+        let target = round % 5;
+        let next = tokio::time::timeout(DEADLINE, async {
+            consumer
+                .seek_to(&topic, taken[target].message_id().clone())
+                .await
+                .expect("seek");
+            take(&mut consumer, &mut Delivered::default(), 1).await
+        })
+        .await
+        .expect("a message within the deadline");
+        let number: u64 = next[0].deserialize().unwrap().parse().unwrap();
+        assert_eq!(number, target as u64 + 2, "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn a_seek_cancelled_after_it_went_out_still_takes_effect() {
+    let cluster = exclusive().await;
+    let topic = topic("seek-cancelled");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &topic, 1..=20).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    let taken = take(&mut consumer, &mut Delivered::default(), 5).await;
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter >= 20)
+        .await;
+
+    // The first poll asks the engine for the connection; the engine, on this
+    // same thread, answers once the test yields; the second poll sends the
+    // request and waits for the broker. Dropped there, the broker moves
+    // anyway, and the client must follow: nothing from before the seek,
+    // nothing lost after it.
+    {
+        let mut seek = Box::pin(consumer.seek_to(&topic, taken[0].message_id().clone()));
+        assert!(
+            futures::poll!(seek.as_mut()).is_pending(),
+            "seek done at once"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            futures::poll!(seek.as_mut()).is_pending(),
+            "seek done in two polls"
+        );
+    }
+
+    let mut after = Delivered::default();
+    collect(&mut consumer, &mut after, 19, DEADLINE).await;
+    after.assert_exactly(&topic, 2..=20);
+}
