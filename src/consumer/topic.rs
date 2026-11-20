@@ -465,8 +465,11 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                     return Poll::Ready(Some(Ok(ConsumerItem::Message(message))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    error!("we are using in the single-consumer and we got an error, {e}");
-                    return Poll::Ready(Some(Err(e)));
+                    error!("consumer of {}: {e}", self.topic);
+                    return Poll::Ready(Some(Err(Error::Consumer(ConsumerError::Topic {
+                        topic: self.topic.clone(),
+                        error: Box::new(e),
+                    }))));
                 }
             }
         }

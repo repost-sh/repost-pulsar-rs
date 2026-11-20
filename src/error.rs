@@ -66,12 +66,21 @@ pub(crate) fn is_permanent(kind: ServerError) -> bool {
 
 impl Error {
     /// The error the broker answered with, if this error carries one.
+    /// The error alone, without the topic a consumer tags it with.
+    pub fn without_topic(&self) -> &Error {
+        match self {
+            Error::Consumer(ConsumerError::Topic { error, .. }) => error.without_topic(),
+            other => other,
+        }
+    }
+
     pub fn server_error(&self) -> Option<ServerError> {
         match self {
             Error::Connection(ConnectionError::PulsarError(kind, _))
             | Error::Consumer(ConsumerError::Connection(ConnectionError::PulsarError(kind, _)))
             | Error::Producer(ProducerError::Connection(ConnectionError::PulsarError(kind, _)))
             | Error::ServiceDiscovery(ServiceDiscoveryError::Query(kind, _)) => *kind,
+            Error::Consumer(ConsumerError::Topic { error, .. }) => error.server_error(),
             _ => None,
         }
     }
@@ -278,6 +287,12 @@ pub enum ConsumerError {
     ChannelFull,
     Closed,
     BuildError,
+    /// An error a consumer hands the application, with the topic or
+    /// partition it came from. [`Error::without_topic`] gives the error alone.
+    Topic {
+        topic: String,
+        error: Box<Error>,
+    },
 }
 
 impl From<ConnectionError> for ConsumerError {
@@ -321,6 +336,11 @@ impl fmt::Display for ConsumerError {
                 "cannot send message to the consumer engine: the channel is closed"
             ),
             ConsumerError::BuildError => write!(f, "Error while building the consumer."),
+            // the inner error's own "consumer error" prefix would repeat
+            ConsumerError::Topic { topic, error } => match error.as_ref() {
+                Error::Consumer(inner) => write!(f, "{topic}: {inner}"),
+                other => write!(f, "{topic}: {other}"),
+            },
         }
     }
 }

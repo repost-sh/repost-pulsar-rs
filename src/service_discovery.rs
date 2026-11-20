@@ -292,25 +292,37 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         &self,
         topic: S,
     ) -> Result<Vec<(String, BrokerAddress)>, ServiceDiscoveryError> {
-        let topic = topic.into();
-        let partitions = self.lookup_partitioned_topic_number(&topic).await?;
+        Ok(self.lookup_partitions(&topic.into()).await?.1)
+    }
+
+    /// The partition count of `topic`, 0 for a plain topic, with the broker of
+    /// each partition, or of the topic itself when it is plain.
+    pub(crate) async fn lookup_partitions(
+        &self,
+        topic: &str,
+    ) -> Result<(u32, Vec<(String, BrokerAddress)>), ServiceDiscoveryError> {
+        let partitions = self.lookup_partitioned_topic_number(topic).await?;
 
         trace!("Partitions for topic {}: {}", topic, partitions);
         let topics = match partitions {
-            0 => vec![topic],
-            _ => (0..partitions)
-                .map(|n| format!("{}-partition-{}", topic, n))
-                .collect(),
+            0 => vec![topic.to_string()],
+            _ => (0..partitions).map(|n| partition_name(topic, n)).collect(),
         };
-        try_join_all(topics.into_iter().map(|topic| {
+        let topics = try_join_all(topics.into_iter().map(|topic| {
             self.lookup_topic(topic.clone())
                 .map(move |address_res| match address_res {
                     Err(e) => Err(e),
                     Ok(address) => Ok((topic, address)),
                 })
         }))
-        .await
+        .await?;
+        Ok((partitions, topics))
     }
+}
+
+/// The name of partition `index` of `topic`.
+pub(crate) fn partition_name(topic: &str, index: u32) -> String {
+    format!("{topic}-partition-{index}")
 }
 
 struct LookupResponse {

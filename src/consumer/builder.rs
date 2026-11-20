@@ -9,8 +9,8 @@ use regex::Regex;
 
 use crate::{
     consumer::{
-        config::ConsumerConfig, data::DeadLetterPolicy, multi::MultiTopicConsumer,
-        options::ConsumerOptions, topic::TopicConsumer, InnerConsumer,
+        config::ConsumerConfig, data::DeadLetterPolicy, full_topic_name, multi,
+        multi::MultiTopicConsumer, options::ConsumerOptions, topic::TopicConsumer, InnerConsumer,
     },
     message::proto::command_subscribe::SubType,
     reader::Reader,
@@ -118,8 +118,9 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         self
     }
 
-    /// Interval for refreshing the topics when using a topic regex or when errors occur with a
-    /// MultiTopicConsumer
+    /// How often a consumer of several topics or partitions looks for partitions
+    /// added to its partitioned topics and for new topics matching its regex
+    /// (default 30 s)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_topic_refresh(mut self, refresh_interval: Duration) -> Self {
         self.topic_refresh = Some(refresh_interval);
@@ -180,7 +181,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     // Checks the builder for inconsistencies
     // returns a config and a list of topics with associated brokers
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    async fn validate(self) -> Result<(ConsumerConfig, Vec<(String, BrokerAddress)>), Error> {
+    async fn validate(self) -> Result<Validated, Error> {
         let ConsumerBuilder {
             pulsar,
             topics,
@@ -211,16 +212,20 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             ));
         }
 
-        let topics: Vec<(String, BrokerAddress)> = try_join_all(
-            topics
-                .into_iter()
-                .flatten()
-                .map(|topic| pulsar.lookup_partitioned_topic(topic)),
-        )
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        let pulsar = &pulsar;
+        let lookups = try_join_all(topics.into_iter().flatten().map(|topic| async move {
+            let (count, partitions) = pulsar.lookup_partitions(&topic).await?;
+            Ok::<_, Error>((topic, count, partitions))
+        }))
+        .await?;
+        let mut partitioned = BTreeMap::new();
+        let mut topics = Vec::new();
+        for (topic, count, partitions) in lookups {
+            if count > 0 {
+                partitioned.insert(topic, count);
+            }
+            topics.extend(partitions);
+        }
 
         if topics.is_empty() && topic_regex.is_none() {
             return Err(Error::Custom(
@@ -267,7 +272,11 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             dead_letter_policy,
             auto_ack: false,
         };
-        Ok((config, topics))
+        Ok(Validated {
+            config,
+            topics,
+            partitioned,
+        })
     }
 
     /// creates a [Consumer] from this builder
@@ -285,23 +294,30 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             ));
         }
         // would this clone() consume too much memory?
-        let (config, joined_topics) = self.clone().validate().await?;
-        self.assemble(config, joined_topics).await
+        let validated = self.clone().validate().await?;
+        self.assemble(validated).await
     }
 
-    /// A consumer of `joined_topics`: one topic consumer each, behind a multi
-    /// consumer when there are several.
+    /// A consumer of the validated topics: one topic consumer each, behind a
+    /// multi consumer when there are several, or partitions that may grow.
     async fn assemble<T: DeserializeMessage>(
         self,
-        config: ConsumerConfig,
-        joined_topics: Vec<(String, BrokerAddress)>,
+        validated: Validated,
     ) -> Result<Consumer<T, Exe>, Error> {
+        let Validated {
+            config,
+            topics: joined_topics,
+            partitioned,
+        } = validated;
         let consumers = try_join_all(joined_topics.into_iter().map(|(topic, addr)| {
             TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone())
         }))
         .await?;
 
-        let consumer = if consumers.len() == 1 {
+        // Java: PulsarClientImpl.java:1165, a partitioned topic gets a multi
+        // consumer even with one partition, so that it can grow.
+        let single = consumers.len() == 1 && partitioned.is_empty() && self.topic_regex.is_none();
+        let consumer = if single {
             let consumer = consumers.into_iter().next().unwrap();
             InnerConsumer::Single(consumer)
         } else {
@@ -309,12 +325,18 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 .into_iter()
                 .map(|c| (c.topic(), Box::pin(c)))
                 .collect();
-            let topics: VecDeque<String> = consumers.keys().cloned().collect();
-            let existing_topics = topics.clone();
+            let existing_topics: VecDeque<String> = consumers.keys().cloned().collect();
             let topic_refresh = self
                 .topic_refresh
                 .unwrap_or_else(|| Duration::from_secs(30));
-            let refresh = Box::pin(self.pulsar.executor.interval(topic_refresh).map(drop));
+            // plain topics alone have nothing to find
+            let refresh: std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send + Sync>> =
+                if partitioned.is_empty() && self.topic_regex.is_none() {
+                    Box::pin(futures::stream::pending())
+                } else {
+                    Box::pin(self.pulsar.executor.interval(topic_refresh).map(drop))
+                };
+            let subscribed = consumers.keys().map(|t| full_topic_name(t)).collect();
             let mut consumer = MultiTopicConsumer {
                 namespace: self
                     .namespace
@@ -322,19 +344,36 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 topic_regex: self.topic_regex,
                 pulsar: self.pulsar,
                 consumers,
-                topics,
+                partitioned,
                 existing_topics,
+                subscribed,
+                ended: false,
                 new_consumers: None,
+                refresh_started: std::time::Instant::now(),
                 refresh,
                 config,
                 disc_last_message_received: None,
                 disc_messages_received: 0,
                 pending_events: VecDeque::new(),
             };
-            if consumer.topic_regex.is_some() {
-                consumer.update_topics();
-                let initial_consumers = consumer.new_consumers.take().unwrap().await?;
-                consumer.add_consumers(initial_consumers);
+            // At build, a namespace that cannot be listed or a topic that
+            // cannot be subscribed is an error, as before.
+            if let Some(regex) = consumer.topic_regex.clone() {
+                let subscribed = consumer.subscribed.clone();
+                let consumers = multi::matching_topics(
+                    &consumer.pulsar,
+                    &regex,
+                    consumer.namespace.clone(),
+                    &consumer.config,
+                    |topic| subscribed.contains(&full_topic_name(topic)),
+                )
+                .await?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+                consumer.add_refreshed(multi::Refreshed {
+                    consumers,
+                    partitioned: BTreeMap::new(),
+                });
             }
             InnerConsumer::Multi(consumer)
         };
@@ -365,19 +404,28 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             ));
         }
         // would this clone() consume too much memory?
-        let (mut config, joined_topics) = self.clone().validate().await?;
-        config.auto_ack = true;
+        let mut validated = self.clone().validate().await?;
+        validated.config.auto_ack = true;
 
         // Internally, the reader interface is implemented as a consumer using an exclusive,
         // non-durable subscription
-        config.options.durable = Some(false);
+        validated.config.options.durable = Some(false);
 
         // the validate() function defaults sub_type to SubType::Shared,
         // but a reader's subscription is exclusive
         warn!("Subscription Type for a reader is `Exclusive`. Resetting.");
-        config.sub_type = SubType::Exclusive;
+        validated.config.sub_type = SubType::Exclusive;
 
-        let consumer = self.assemble(config, joined_topics).await?;
+        let consumer = self.assemble(validated).await?;
         Ok(Reader { consumer, topic })
     }
+}
+
+/// What `validate` found: the configuration, every topic and partition to
+/// subscribe with its broker, and the partition count of each partitioned
+/// topic the application named.
+struct Validated {
+    config: ConsumerConfig,
+    topics: Vec<(String, BrokerAddress)>,
+    partitioned: BTreeMap<String, u32>,
 }

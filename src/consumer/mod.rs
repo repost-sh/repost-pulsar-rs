@@ -268,10 +268,20 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
-    /// The topic consumer, unless this consumer reads several.
+    /// The topic consumer, unless this consumer reads several topics or
+    /// partitions.
     pub(crate) fn single_mut(&mut self) -> Option<&mut TopicConsumer<T, Exe>> {
         match &mut self.inner {
             InnerConsumer::Single(c) => Some(c),
+            // a partitioned topic of one partition, not one partition left
+            // of several
+            InnerConsumer::Multi(c)
+                if c.topic_regex.is_none()
+                    && c.consumers.len() == 1
+                    && c.partitioned.values().eq([&1]) =>
+            {
+                c.consumers.values_mut().next().map(|c| &mut **c)
+            }
             InnerConsumer::Multi(_) => None,
         }
     }

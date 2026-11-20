@@ -19,9 +19,10 @@ use crate::{
 /// position, through a non-durable subscription. It acknowledges each message
 /// as the application takes it.
 ///
-/// On a partitioned topic, a partition whose consumer fails for good is
-/// logged and dropped, and rebuilt at the next topic refresh (30 s by
-/// default) from the configured start.
+/// On a partitioned topic, partitions added later are found at each topic
+/// refresh (30 s by default) and read from their beginning. A partition whose
+/// consumer fails for good hands over its error and is dropped; the others
+/// carry on.
 pub struct Reader<T: DeserializeMessage, Exe: Executor> {
     pub(crate) consumer: Consumer<T, Exe>,
     /// The topic the reader was built for, partitioned or not.

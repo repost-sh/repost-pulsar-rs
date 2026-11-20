@@ -1532,7 +1532,17 @@ pub(crate) mod messages {
                     auth_data,
                     proxy_to_broker_url,
                     client_version: proto::client_version(),
-                    protocol_version: Some(12),
+                    // The newest version this proto file knows. Of what the
+                    // broker gates on v13..v19, broker entry metadata also
+                    // needs supports_broker_entry_metadata, which stays off.
+                    protocol_version: Some(proto::ProtocolVersion::V19 as i32),
+                    // The broker then asks for fresh credentials before old
+                    // ones expire, instead of closing the connection; the
+                    // challenge is answered from the auth provider.
+                    feature_flags: Some(proto::FeatureFlags {
+                        supports_auth_refresh: Some(true),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

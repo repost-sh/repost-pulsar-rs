@@ -391,6 +391,15 @@ impl<Exe: Executor> Pulsar<Exe> {
             .map_err(|e| e.into())
     }
 
+    /// The partition count of `topic`, 0 for a plain topic, with the broker of
+    /// each partition, or of the topic itself when it is plain.
+    pub(crate) async fn lookup_partitions(
+        &self,
+        topic: &str,
+    ) -> Result<(u32, Vec<(String, BrokerAddress)>), Error> {
+        Ok(self.service_discovery.lookup_partitions(topic).await?)
+    }
+
     /// gets the list of topics from a namespace
     ///
     /// ```rust,no_run

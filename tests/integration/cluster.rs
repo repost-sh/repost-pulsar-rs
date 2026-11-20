@@ -374,6 +374,17 @@ impl Cluster {
         .await;
     }
 
+    /// Deletes a partitioned topic and its partitions, closing every producer
+    /// and consumer on them.
+    pub async fn delete_partitioned_topic(&self, topic: &str) {
+        self.admin(
+            reqwest::Method::DELETE,
+            &format!("{}/partitions?force=true", path(topic)),
+            None,
+        )
+        .await;
+    }
+
     /// Creates [`STRICT_NAMESPACE`] if it is missing.
     pub async fn ensure_strict_namespace(&self) {
         let path = format!("admin/v2/namespaces/{STRICT_NAMESPACE}");
