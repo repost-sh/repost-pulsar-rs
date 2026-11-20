@@ -8,4 +8,6 @@
 //! reuse it. `cluster.rs` shows how to remove it.
 
 mod cluster;
+mod delivery;
+mod reconnect;
 mod smoke;

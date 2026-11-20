@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context, Poll},
     time::Duration,
@@ -19,7 +19,7 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, EngineMessage, MessageData, MessageIdDataReceiver},
+        data::{DeadLetterPolicy, Delivery, EngineMessage, MessageData, MessageIdDataReceiver},
         engine::ConsumerEngine,
         message::Message,
     },
@@ -36,6 +36,7 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) config: ConsumerConfig,
     topic: String,
     messages: Pin<Box<MessageIdDataReceiver>>,
+    delivery: Arc<Mutex<Delivery>>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -105,6 +106,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         }
         let receiver_queue_size = options.receiver_queue_size.unwrap_or(1000);
         let (tx, rx) = mpsc::channel(receiver_queue_size as usize);
+        let delivery = Arc::new(Mutex::new(Delivery::default()));
         let mut c = ConsumerEngine::new(
             client.clone(),
             connection.clone(),
@@ -115,6 +117,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             consumer_name,
             tx,
             messages,
+            delivery.clone(),
             engine_rx,
             batch_size,
             unacked_message_redelivery_delay,
@@ -137,6 +140,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             config,
             topic,
             messages: Box::pin(rx),
+            delivery,
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,
@@ -241,11 +245,30 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         timestamp: Option<u64>,
     ) -> Result<(), Error> {
         let consumer_id = self.consumer_id;
-        self.connection()
-            .await?
+        let connection = self.connection().await?;
+        // The broker closes the consumer before it confirms the seek, so the
+        // engine's reconnect has to find the target before the request goes.
+        // Java: ConsumerImpl.java:3048 seekAsyncInternal sets seekMessageId
+        // first and restores it if the seek fails.
+        let before = {
+            let mut delivery = self.delivery.lock().unwrap();
+            let before = (
+                delivery.last.take(),
+                delivery.first_queued.take(),
+                delivery.seek_target.clone(),
+            );
+            delivery.seek_target = message_id.clone();
+            before
+        };
+        let result = connection
             .sender()
             .seek(consumer_id, message_id, timestamp)
-            .await?;
+            .await;
+        if result.is_err() {
+            let mut delivery = self.delivery.lock().unwrap();
+            (delivery.last, delivery.first_queued, delivery.seek_target) = before;
+        }
+        result?;
         Ok(())
     }
 
@@ -319,17 +342,28 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.messages.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Ok((id, payload)))) => {
-                self.last_message_received = Some(Utc::now());
-                self.messages_received += 1;
-                Poll::Ready(Some(Ok(self.create_message(id, payload))))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                error!("we are using in the single-consumer and we got an error, {e}");
-                Poll::Ready(Some(Err(e)))
+        loop {
+            match self.messages.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Ok((epoch, id, payload)))) => {
+                    // C++: lib/ConsumerImpl.cc:1162 receiveHelper drops messages
+                    // that arrived on an earlier connection.
+                    {
+                        let mut delivery = self.delivery.lock().unwrap();
+                        if epoch != delivery.epoch {
+                            continue;
+                        }
+                        delivery.last = Some(id.clone());
+                    }
+                    self.last_message_received = Some(Utc::now());
+                    self.messages_received += 1;
+                    return Poll::Ready(Some(Ok(self.create_message(id, payload))));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    error!("we are using in the single-consumer and we got an error, {e}");
+                    return Poll::Ready(Some(Err(e)));
+                }
             }
         }
     }

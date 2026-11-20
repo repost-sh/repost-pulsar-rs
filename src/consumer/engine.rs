@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -14,10 +14,10 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{DeadLetterPolicy, EngineEvent, EngineMessage},
+        data::{DeadLetterPolicy, Delivery, EngineEvent, EngineMessage},
         options::ConsumerOptions,
     },
-    error::{ConnectionError, ConsumerError},
+    error::{self, ConnectionError, ConsumerError},
     message::{
         proto::{command_subscribe::SubType, MessageIdData},
         Message as RawMessage,
@@ -25,7 +25,7 @@ use crate::{
     producer::Message,
     proto,
     proto::{BaseCommand, CommandCloseConsumer, CommandMessage},
-    retry_op::retry_subscribe_consumer,
+    retry_op::{send_initial_flow, subscribe_once},
     Error, Executor, Payload, Pulsar,
 };
 
@@ -40,8 +40,19 @@ pub struct ConsumerEngine<Exe: Executor> {
     sub_type: SubType,
     id: u64,
     name: Option<String>,
-    tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+    tx: mpsc::Sender<Result<(u64, MessageIdData, Payload), Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
+    delivery: Arc<Mutex<Delivery>>,
+    /// The epoch of the current connection, as last written to `delivery`.
+    epoch: u64,
+    /// Messages at or before this id are dropped, as the broker sends the entry
+    /// a subscription restarts from again.
+    start: Option<MessageIdData>,
+    /// Where a non-durable subscription starts when nothing was delivered.
+    configured_start: Option<MessageIdData>,
+    /// Whether `Delivery::first_queued` no longer needs updating, which spares
+    /// a lock per message.
+    first_queued_known: bool,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
     event_tx: UnboundedSender<EngineEvent<Exe>>,
@@ -63,8 +74,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         sub_type: SubType,
         id: u64,
         name: Option<String>,
-        tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+        tx: mpsc::Sender<Result<(u64, MessageIdData, Payload), Error>>,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
+        delivery: Arc<Mutex<Delivery>>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
         batch_size: u32,
         unacked_message_redelivery_delay: Option<Duration>,
@@ -82,6 +94,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             name,
             tx,
             messages_rx: Some(messages_rx),
+            delivery,
+            epoch: 0,
+            start: None,
+            configured_start: options.start_message_id.clone(),
+            first_queued_known: false,
             engine_rx: Some(engine_rx),
             event_rx,
             event_tx,
@@ -138,7 +155,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
 
             if let Some(messages_rx) = self.messages_rx.take() {
-                self.register_source(messages_rx, |msg| EngineEvent::Message(msg))
+                let epoch = self.epoch;
+                self.register_source(messages_rx, move |msg| EngineEvent::Message(epoch, msg))
                     .map_err(|_| {
                         Error::Custom(String::from("Error registering messages_rx source"))
                     })?;
@@ -214,7 +232,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     // ```
                     debug!("consumer engine: timeout (1s)");
                 }
-                Ok(Some(EngineEvent::Message(msg))) => {
+                Ok(Some(EngineEvent::Message(epoch, _))) if epoch != self.epoch => {
+                    debug!("consumer engine: dropped a frame from a previous connection");
+                }
+                Ok(Some(EngineEvent::Message(_, msg))) => {
                     debug!("consumer engine: received message, {:?}", msg);
                     let out = self.handle_message_opt(msg).await;
                     if let Some(res) = out {
@@ -418,7 +439,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     self.debug_format()
                 );
 
-                self.reconnect().await?;
+                // A failed reconnect has told the consumer why, so the engine
+                // stops here instead of relaying a second error.
+                if self.reconnect().await.is_err() {
+                    return Ok(false);
+                }
             }
             unexpected => {
                 let r#type = proto::base_command::Type::try_from(unexpected.command.r#type)
@@ -541,6 +566,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             vec![(message.message_id, payload)]
         };
         for (message_id, payload) in payloads {
+            if let Some(start) = &self.start {
+                if is_at_or_before(&message_id, start) {
+                    debug!(
+                        "consumer engine: dropped {message_id:?}, delivered before the reconnect"
+                    );
+                    continue;
+                }
+                // The broker delivers in order, so nothing after this matches.
+                self.start = None;
+            }
             match (message.redelivery_count, &self.dead_letter_policy) {
                 (Some(redelivery_count), Some(dead_letter_policy))
                     if redelivery_count as usize >= dead_letter_policy.max_redeliver_count =>
@@ -607,23 +642,69 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         message_id: MessageIdData,
         payload: Payload,
     ) -> Result<(), Error> {
-        let now = Instant::now();
+        if !self.first_queued_known {
+            let mut delivery = self.delivery.lock().unwrap();
+            if delivery.last.is_none() && delivery.first_queued.is_none() {
+                delivery.first_queued = Some(message_id.clone());
+            }
+            self.first_queued_known = true;
+        }
+        let tracked = self
+            .unacked_message_redelivery_delay
+            .map(|delay| (message_id.clone(), Instant::now() + delay));
         self.tx
-            .send(Ok((message_id.clone(), payload)))
+            .send(Ok((self.epoch, message_id, payload)))
             .await
             .map_err(|e| {
                 error!("tx returned {:?}", e);
                 Error::Custom("tx closed".to_string())
             })?;
-        if let Some(duration) = self.unacked_message_redelivery_delay {
-            self.unacked_messages.insert(message_id, now + duration);
+        if let Some((message_id, deadline)) = tracked {
+            self.unacked_messages.insert(message_id, deadline);
         }
         Ok(())
     }
 
+    /// Subscribes again after the connection broke or the broker closed the
+    /// consumer, and keeps trying until it succeeds, the topic is gone, or the
+    /// application dropped the consumer.
+    ///
+    /// Messages still buffered from the old connection are not delivered. A
+    /// durable subscription gets them again from the broker. A non-durable one
+    /// resumes after the last message the application received.
+    // C++: lib/ConsumerImpl.cc:228 ConsumerImpl::connectionOpened
+    // C++: lib/ConsumerImpl.cc:1347 ConsumerImpl::clearReceiveQueue
+    // C++: lib/HandlerBase.cc:182 HandlerBase::scheduleReconnection
+    // Java: pulsar-client/.../impl/ConsumerImpl.java:1035 clearReceiverQueue on reconnect
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
+        {
+            let mut delivery = self.delivery.lock().unwrap();
+            delivery.epoch += 1;
+            self.epoch = delivery.epoch;
+            let non_durable = self.options.durable == Some(false);
+            if let Some(target) = delivery.seek_target.take() {
+                // Java: ConsumerImpl.java:3070, after a seek the target becomes
+                // the exclusive start.
+                if non_durable {
+                    self.options.start_message_id = Some(target.clone());
+                }
+                self.start = Some(target);
+            } else if non_durable {
+                let (start_message_id, start) = match (&delivery.last, &delivery.first_queued) {
+                    (Some(last), _) => (Some(last.clone()), Some(last.clone())),
+                    (None, Some(first)) => (Some(first.clone()), before_in_entry(first)),
+                    (None, None) => (self.configured_start.clone(), None),
+                };
+                self.options.start_message_id = start_message_id;
+                self.start = start;
+            }
+            if delivery.first_queued.is_none() {
+                self.first_queued_known = false;
+            }
+        }
+        self.unacked_messages.clear();
 
         // send CloseConsumer to server
         // remove our resolver from the Connection consumers BTreeMap,
@@ -634,28 +715,101 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.name, self.id, self.topic, e
             );
         }
-        // should have logged "rx terminated" by now
 
+        let mut acks = Vec::new();
+        let mut attempt = 0;
+        loop {
+            if self.tx.is_closed() {
+                return Err(Error::Consumer(ConsumerError::Closed));
+            }
+            match self.resubscribe().await {
+                Ok(messages) => {
+                    self.remaining_messages = self.batch_size as i64;
+                    self.messages_rx = Some(messages);
+                    for (message_id, cumulative) in acks {
+                        self.ack(message_id, cumulative).await;
+                    }
+                    return Ok(());
+                }
+                // Java retries everything but a deleted topic; errors that no
+                // retry can fix (permissions, schema) are reported here too.
+                Err(e) if e.server_error().is_some_and(error::is_permanent) => {
+                    error!(
+                        "consumer {}: cannot subscribe again: {e}",
+                        self.debug_format()
+                    );
+                    let _ = self.tx.send(Err(e)).await;
+                    return Err(Error::Consumer(ConsumerError::Closed));
+                }
+                Err(e) => {
+                    let delay = self.client.manager.backoff(attempt);
+                    attempt += 1;
+                    warn!(
+                        "consumer {}: reconnect failed, retrying in {delay:?}: {e}",
+                        self.debug_format()
+                    );
+                    if !self.wait_disconnected(delay, &mut acks).await {
+                        return Err(Error::Consumer(ConsumerError::Closed));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One attempt: look the topic up, connect to its broker, subscribe.
+    async fn resubscribe(&mut self) -> Result<mpsc::UnboundedReceiver<RawMessage>, Error> {
         let broker_address = self.client.lookup_topic(&self.topic).await?;
-
-        let messages = retry_subscribe_consumer(
-            &self.client,
-            &mut self.connection,
-            broker_address,
+        self.connection = self.client.manager.get_connection(&broker_address).await?;
+        let messages = subscribe_once(
+            &self.connection,
             &self.topic,
             &self.subscription,
             self.sub_type,
             self.id,
             &self.name,
             &self.options,
-            self.batch_size,
         )
         .await?;
+        send_initial_flow(&self.connection, &self.topic, self.id, self.batch_size).await?;
+        Ok(messages)
+    }
 
-        self.remaining_messages = self.batch_size as i64;
-        self.messages_rx = Some(messages);
-
-        Ok(())
+    /// Waits out `delay` between reconnect attempts while still answering the
+    /// consumer: acks are kept for the new connection, and a connection request
+    /// gets the old one, so a close or seek fails fast instead of hanging.
+    /// Returns false once the application has dropped the consumer.
+    async fn wait_disconnected(
+        &mut self,
+        delay: Duration,
+        acks: &mut Vec<(MessageIdData, bool)>,
+    ) -> bool {
+        let mut timer = Box::pin(self.client.executor.delay(delay));
+        loop {
+            // The redelivery ticker keeps the engine channel open after the
+            // consumer is dropped, so the message channel tells instead.
+            if self.tx.is_closed() {
+                return false;
+            }
+            let event = match futures::future::select(&mut timer, self.event_rx.next()).await {
+                futures::future::Either::Left(_) => return true,
+                futures::future::Either::Right((event, _)) => event,
+            };
+            match event {
+                Some(EngineEvent::EngineMessage(Some(EngineMessage::Ack(id, cumulative)))) => {
+                    acks.push((id, cumulative));
+                }
+                Some(EngineEvent::EngineMessage(Some(EngineMessage::GetConnection(sender)))) => {
+                    let _ = sender.send(self.connection.clone());
+                }
+                // the broker redelivers what is unacked once the consumer is back
+                Some(EngineEvent::EngineMessage(Some(
+                    EngineMessage::Nack(_) | EngineMessage::UnackedRedelivery,
+                ))) => {}
+                // frames from the old connection
+                Some(EngineEvent::Message(..)) => {}
+                Some(EngineEvent::EngineMessage(None)) | None => return false,
+            }
+        }
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -706,4 +860,34 @@ impl<Exe: Executor> std::ops::Drop for ConsumerEngine<Exe> {
             }
         }));
     }
+}
+
+/// Whether `id` was already delivered when the subscription restarts from
+/// `start`. The broker resends the whole entry `start` is in, so for a batch
+/// the earlier members of that entry are dropped too.
+// C++: lib/ConsumerImpl.cc:793 messageReceived, prior-entry check
+// C++: lib/ConsumerImpl.cc:971 receiveIndividualMessagesFromBatch, prior-batch-index check
+fn is_at_or_before(id: &MessageIdData, start: &MessageIdData) -> bool {
+    if id.ledger_id != start.ledger_id {
+        return false;
+    }
+    match id.batch_index {
+        Some(index) => {
+            id.entry_id < start.entry_id
+                || (id.entry_id == start.entry_id && index <= start.batch_index.unwrap_or(-1))
+        }
+        None => id.entry_id <= start.entry_id,
+    }
+}
+
+/// The filter that keeps `first` and drops what precedes it in its entry,
+/// since the broker resends the whole entry. Nothing precedes a message that
+/// is not in a batch, or that opens one.
+// C++: lib/ConsumerImpl.cc:1371 clearReceiveQueue, previous message in the batch
+fn before_in_entry(first: &MessageIdData) -> Option<MessageIdData> {
+    let index = first.batch_index.filter(|&index| index > 0)?;
+    Some(MessageIdData {
+        batch_index: Some(index - 1),
+        ..first.clone()
+    })
 }

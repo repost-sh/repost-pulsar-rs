@@ -88,30 +88,27 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
     batch_size: u32,
 ) -> Result<UnboundedReceiver<Message>, Error> {
     *connection = client.manager.get_connection(&addr).await?;
-    let (resolver, messages) = mpsc::unbounded();
     let mut current_retries = 0u32;
     let start = Instant::now();
 
-    loop {
+    let messages = loop {
         warn!(
             "Retry #{current_retries} -> connecting consumer {consumer_id} using connection {:#} to broker {:#} to topic {topic}",
             connection.id(),
             addr.url,
         );
-        match connection
-            .sender()
-            .subscribe(
-                resolver.clone(),
-                topic.to_owned(),
-                subscription.to_owned(),
-                sub_type,
-                consumer_id,
-                consumer_name.clone(),
-                options.clone(),
-            )
-            .await
+        match subscribe_once(
+            connection,
+            topic,
+            subscription,
+            sub_type,
+            consumer_id,
+            consumer_name,
+            options,
+        )
+        .await
         {
-            Ok(_) => {
+            Ok(messages) => {
                 if current_retries > 0 {
                     let dur = (Instant::now() - start).as_secs();
                     info!(
@@ -119,7 +116,7 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
                         current_retries + 1,
                     );
                 }
-                break;
+                break messages;
             }
             Err(err) => {
                 handle_retry_error(
@@ -135,7 +132,45 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
             }
         }
         current_retries += 1;
-    }
+    };
+    send_initial_flow(connection, topic, consumer_id, batch_size).await?;
+    Ok(messages)
+}
+
+/// Sends one subscribe request on `connection`, and returns where the
+/// broker's messages for this consumer arrive.
+pub async fn subscribe_once<Exe: Executor>(
+    connection: &Arc<Connection<Exe>>,
+    topic: &str,
+    subscription: &str,
+    sub_type: SubType,
+    consumer_id: u64,
+    consumer_name: &Option<String>,
+    options: &ConsumerOptions,
+) -> Result<UnboundedReceiver<Message>, ConnectionError> {
+    let (resolver, messages) = mpsc::unbounded();
+    connection
+        .sender()
+        .subscribe(
+            resolver,
+            topic.to_owned(),
+            subscription.to_owned(),
+            sub_type,
+            consumer_id,
+            consumer_name.clone(),
+            options.clone(),
+        )
+        .await?;
+    Ok(messages)
+}
+
+/// Grants the broker its first `batch_size` permits for a new subscription.
+pub async fn send_initial_flow<Exe: Executor>(
+    connection: &Arc<Connection<Exe>>,
+    topic: &str,
+    consumer_id: u64,
+    batch_size: u32,
+) -> Result<(), Error> {
     connection
         .sender()
         .send_flow(consumer_id, batch_size)
@@ -143,9 +178,7 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
         .map_err(|err| {
             error!("TopicConsumer::send_flow({topic}) error: {err:?}");
             Error::Consumer(ConsumerError::Connection(err))
-        })?;
-
-    Ok(messages)
+        })
 }
 
 pub async fn retry_create_producer<Exe: Executor>(

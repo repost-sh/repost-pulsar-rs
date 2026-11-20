@@ -333,6 +333,18 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
+    /// How long to wait before retry number `attempt` (counting from 0): an
+    /// exponential backoff from `min_backoff`, capped at `max_backoff`, plus
+    /// jitter so clients that lost a broker together do not retry together.
+    pub(crate) fn backoff(&self, attempt: u32) -> std::time::Duration {
+        let options = &self.connection_retry_options;
+        let jitter = rand::thread_rng().gen_range(0..10);
+        std::cmp::min(
+            options.min_backoff * 2u32.saturating_pow(attempt),
+            options.max_backoff,
+        ) + options.min_backoff * jitter
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn connect_inner(
         &self,
@@ -396,12 +408,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         return Err(e);
                     }
 
-                    let jitter = rand::thread_rng().gen_range(0..10);
-                    current_backoff = std::cmp::min(
-                        self.connection_retry_options.min_backoff
-                            * 2u32.saturating_pow(current_retries),
-                        self.connection_retry_options.max_backoff,
-                    ) + self.connection_retry_options.min_backoff * jitter;
+                    current_backoff = self.backoff(current_retries);
                     current_retries += 1;
 
                     trace!(

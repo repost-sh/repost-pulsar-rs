@@ -28,6 +28,9 @@ const NETWORK: &str = "rprs-test";
 const LABEL: &str = "rprs.cluster=test";
 const CLUSTER_NAME: &str = "test";
 const NAMESPACE: &str = "public/default";
+/// A namespace where the broker never creates a topic on its own, as on
+/// staging, so a deleted topic stays deleted.
+pub const STRICT_NAMESPACE: &str = "public/strict";
 const ZOOKEEPER: &str = "rprs-zk";
 const BOOKIE: &str = "rprs-bookie";
 const HOLDER: &str = "rprs-brokers-net";
@@ -65,7 +68,12 @@ pub async fn exclusive() -> MutexGuard<'static, Cluster> {
 
 /// A fresh topic name in the test namespace.
 pub fn topic(prefix: &str) -> String {
-    format!("persistent://{NAMESPACE}/{prefix}-{}", uuid::Uuid::new_v4())
+    topic_in(NAMESPACE, prefix)
+}
+
+/// A fresh topic name in `namespace`.
+pub fn topic_in(namespace: &str, prefix: &str) -> String {
+    format!("persistent://{namespace}/{prefix}-{}", uuid::Uuid::new_v4())
 }
 
 fn service_url(broker: usize) -> String {
@@ -268,10 +276,32 @@ struct Lookup {
     broker_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TopicStats {
+    subscriptions: std::collections::BTreeMap<String, SubscriptionStats>,
+}
+
+/// What the broker knows about a subscription.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionStats {
+    /// Messages not yet acknowledged.
+    pub msg_backlog: u64,
+    /// Messages dispatched to the subscription's consumers, buffered or not.
+    pub msg_out_counter: u64,
+}
+
 impl Cluster {
     /// A client bootstrapped through a broker that is up.
     pub async fn client(&self) -> Pulsar<TokioExecutor> {
         let broker = self.running().next().expect("a running broker");
+        self.client_via(broker).await
+    }
+
+    /// A client whose lookups go through `broker`. Fault tests bootstrap
+    /// through the broker that stays up, as a production service URL always
+    /// reaches a live broker.
+    pub async fn client_via(&self, broker: usize) -> Pulsar<TokioExecutor> {
         Pulsar::builder(service_url(broker), TokioExecutor)
             .build()
             .await
@@ -296,7 +326,37 @@ impl Cluster {
         self.admin(
             method,
             &format!("{}/partitions", path(topic)),
-            Some(partitions),
+            Some(partitions.into()),
+        )
+        .await;
+    }
+
+    /// Deletes a topic, closing every producer and consumer on it.
+    pub async fn delete_topic(&self, topic: &str) {
+        self.admin(
+            reqwest::Method::DELETE,
+            &format!("{}?force=true", path(topic)),
+            None,
+        )
+        .await;
+    }
+
+    /// Creates [`STRICT_NAMESPACE`] if it is missing.
+    pub async fn ensure_strict_namespace(&self) {
+        let path = format!("admin/v2/namespaces/{STRICT_NAMESPACE}");
+        let created = self
+            .web(reqwest::Method::PUT, &path, None)
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        let status = created.status();
+        assert!(
+            status.is_success() || status == reqwest::StatusCode::CONFLICT,
+            "{path}: {status}"
+        );
+        self.admin(
+            reqwest::Method::POST,
+            &format!("namespaces/{STRICT_NAMESPACE}/autoTopicCreation"),
+            Some(serde_json::json!({ "allowAutoTopicCreation": false })),
         )
         .await;
     }
@@ -347,6 +407,39 @@ impl Cluster {
         assert!(moved, "{what} not within {FAILOVER_TIMEOUT:?}");
     }
 
+    /// Waits until the broker's view of `subscription` on `topic` satisfies
+    /// `holds`, for example that every ack has landed.
+    pub async fn wait_subscription(
+        &self,
+        topic: &str,
+        subscription: &str,
+        holds: impl Fn(&SubscriptionStats) -> bool,
+    ) {
+        let last = std::cell::RefCell::new(SubscriptionStats::default());
+        let held = eventually(FAILOVER_TIMEOUT, || async {
+            let mut stats: TopicStats = self
+                .admin(
+                    reqwest::Method::GET,
+                    &format!("{}/stats", path(topic)),
+                    None,
+                )
+                .await
+                .json()
+                .await
+                .expect("topic stats");
+            let current = stats.subscriptions.remove(subscription).unwrap_or_default();
+            let done = holds(&current);
+            *last.borrow_mut() = current;
+            done
+        })
+        .await;
+        assert!(
+            held,
+            "{subscription} on {topic} never reached the state: {:?}",
+            last.borrow()
+        );
+    }
+
     /// Stops a broker the way a crash does: no graceful unload of its topics.
     pub async fn kill_broker(&mut self, broker: usize) {
         self.down[broker] = true;
@@ -373,7 +466,7 @@ impl Cluster {
         &self,
         method: reqwest::Method,
         path: &str,
-        body: Option<u32>,
+        body: Option<serde_json::Value>,
     ) -> reqwest::Response {
         let response = self
             .web(method, &format!("admin/v2/{path}"), body)
@@ -397,14 +490,14 @@ impl Cluster {
         &self,
         method: reqwest::Method,
         path: &str,
-        body: Option<u32>,
+        body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response, String> {
         let http = http();
         let mut errors = Vec::new();
         for broker in self.running() {
             let url = format!("{}/{path}", web_url(broker));
             let mut request = http.request(method.clone(), url);
-            if let Some(body) = body {
+            if let Some(body) = &body {
                 request = request.json(&body);
             }
             match request.send().await {

@@ -50,6 +50,33 @@ impl From<ServiceDiscoveryError> for Error {
     }
 }
 
+/// Broker errors that retrying a subscribe or a producer creation cannot fix.
+pub(crate) fn is_permanent(kind: ServerError) -> bool {
+    matches!(
+        kind,
+        ServerError::TopicNotFound
+            | ServerError::TopicTerminatedError
+            | ServerError::AuthenticationError
+            | ServerError::AuthorizationError
+            | ServerError::IncompatibleSchema
+            | ServerError::NotAllowedError
+            | ServerError::InvalidTopicName
+    )
+}
+
+impl Error {
+    /// The error the broker answered with, if this error carries one.
+    pub fn server_error(&self) -> Option<ServerError> {
+        match self {
+            Error::Connection(ConnectionError::PulsarError(kind, _))
+            | Error::Consumer(ConsumerError::Connection(ConnectionError::PulsarError(kind, _)))
+            | Error::Producer(ProducerError::Connection(ConnectionError::PulsarError(kind, _)))
+            | Error::ServiceDiscovery(ServiceDiscoveryError::Query(kind, _)) => *kind,
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

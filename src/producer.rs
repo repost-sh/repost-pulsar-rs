@@ -25,7 +25,7 @@ use crate::{
     client::SerializeMessage,
     compression::Compression,
     connection::{Connection, SerialId},
-    error::{ConnectionError, ProducerError, ServiceDiscoveryError},
+    error::{self, ConnectionError, ProducerError},
     executor::Executor,
     message::{
         proto::{self, CommandSendReceipt, EncryptionKeys, Schema},
@@ -1280,27 +1280,10 @@ fn expired() -> Error {
 
 /// Errors after which re-creating the producer cannot succeed.
 fn is_permanent(error: &Error) -> bool {
-    use proto::ServerError as E;
-    let kind = match error {
-        Error::Producer(ProducerError::Closed) => return true,
-        Error::Connection(ConnectionError::PulsarError(kind, _))
-        | Error::Producer(ProducerError::Connection(ConnectionError::PulsarError(kind, _)))
-        | Error::ServiceDiscovery(ServiceDiscoveryError::Query(kind, _)) => kind,
-        _ => return false,
-    };
-    matches!(
-        kind,
-        Some(
-            E::TopicNotFound
-                | E::TopicTerminatedError
-                | E::AuthenticationError
-                | E::AuthorizationError
-                | E::ProducerFenced
-                | E::IncompatibleSchema
-                | E::NotAllowedError
-                | E::InvalidTopicName
-        )
-    )
+    matches!(error, Error::Producer(ProducerError::Closed))
+        || error.server_error().is_some_and(|kind| {
+            kind == proto::ServerError::ProducerFenced || error::is_permanent(kind)
+        })
 }
 
 impl<Exe: Executor> std::ops::Drop for TopicProducer<Exe> {

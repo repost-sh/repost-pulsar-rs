@@ -1,9 +1,11 @@
 //! Proves the cluster helpers do what the fault-injection tests rely on.
 
 use futures::TryStreamExt;
-use pulsar::{consumer::InitialPosition, Consumer, ConsumerOptions, SubType};
 
-use crate::cluster::{exclusive, topic, Cluster};
+use crate::{
+    cluster::{exclusive, topic, Cluster},
+    delivery::earliest_consumer,
+};
 
 #[tokio::test]
 async fn a_topic_round_trips() {
@@ -67,15 +69,7 @@ async fn unload_and_partition_updates_take_effect() {
 
 async fn round_trip(cluster: &Cluster, topic: &str, payload: &str) -> String {
     let pulsar = cluster.client().await;
-    let mut consumer: Consumer<String, _> = pulsar
-        .consumer()
-        .with_topic(topic)
-        .with_subscription("smoke")
-        .with_subscription_type(SubType::Exclusive)
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
-        .build()
-        .await
-        .expect("consumer");
+    let mut consumer = earliest_consumer(&pulsar, topic, "smoke").await;
     pulsar
         .send(topic, payload)
         .await
