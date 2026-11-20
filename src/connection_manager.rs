@@ -516,10 +516,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 if let Some(ConnectionStatus::Connecting(mut v)) =
                     self.connections.lock().await.remove(&broker)
                 {
+                    // each waiter learns why, a refused credential say
                     for tx in v.drain(..) {
-                        // we cannot clone ConnectionError so we tell other
-                        // tasks that reconnection is canceled
-                        let _ = tx.send(Err(ConnectionError::Canceled));
+                        let _ = tx.send(Err(e.for_waiter()));
                     }
                 }
 

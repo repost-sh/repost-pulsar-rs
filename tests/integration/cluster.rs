@@ -24,7 +24,7 @@ use tokio::{
 };
 
 const IMAGE: &str = "apachepulsar/pulsar:5.0.1";
-const NETWORK: &str = "rprs-test";
+pub(crate) const NETWORK: &str = "rprs-test";
 const LABEL: &str = "rprs.cluster=test";
 const CLUSTER_NAME: &str = "test";
 const NAMESPACE: &str = "public/default";
@@ -35,7 +35,7 @@ const ZOOKEEPER: &str = "rprs-zk";
 const BOOKIE: &str = "rprs-bookie";
 const HOLDER: &str = "rprs-brokers-net";
 const BROKERS: [&str; 2] = ["rprs-broker-1", "rprs-broker-2"];
-const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
+pub(crate) const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
 /// The brokers' metadata session lasts 10 s, so a dead broker's topics move
 /// well within this.
 const FAILOVER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -92,19 +92,24 @@ fn web_url(broker: usize) -> String {
     format!("http://127.0.0.1:{}", 8080 + broker)
 }
 
-struct Container<'a> {
-    name: &'a str,
-    network: &'a str,
-    ports: &'a [usize],
-    env: &'a [(&'a str, &'a str)],
-    script: &'a str,
+pub(crate) struct Container<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) network: &'a str,
+    pub(crate) ports: &'a [usize],
+    pub(crate) env: &'a [(&'a str, &'a str)],
+    pub(crate) script: &'a str,
+}
+
+/// Creates the test network if it is missing.
+pub(crate) async fn ensure_network() {
+    if !docker_ok(&["network", "inspect", NETWORK]).await {
+        docker(&["network", "create", NETWORK]).await;
+    }
 }
 
 async fn boot() -> Cluster {
     let _ = env_logger::builder().is_test(true).try_init();
-    if !docker_ok(&["network", "inspect", NETWORK]).await {
-        docker(&["network", "create", NETWORK]).await;
-    }
+    ensure_network().await;
     let label_filter = format!("label={LABEL}");
     let existing = docker(&[
         "ps",
@@ -261,7 +266,7 @@ async fn boot() -> Cluster {
 ///
 /// Docker's network DNS resolves containers by name, so each name doubles as
 /// the address the other containers use.
-async fn up(exists: bool, container: Container<'_>) {
+pub(crate) async fn up(exists: bool, container: Container<'_>) {
     if exists {
         // a test that froze a broker and then failed leaves it paused
         docker_ok(&["unpause", container.name]).await;
@@ -290,8 +295,8 @@ struct Lookup {
 }
 
 #[derive(Debug, Deserialize)]
-struct TopicStats {
-    subscriptions: std::collections::BTreeMap<String, SubscriptionStats>,
+pub(crate) struct TopicStats {
+    pub(crate) subscriptions: std::collections::BTreeMap<String, SubscriptionStats>,
 }
 
 /// What the broker knows about a subscription.
@@ -304,7 +309,16 @@ pub struct SubscriptionStats {
     /// since the topic was last loaded.
     pub msg_out_counter: u64,
     #[serde(default)]
-    pub consumers: Vec<serde::de::IgnoredAny>,
+    pub consumers: Vec<ConsumerStats>,
+}
+
+/// What the broker knows about one consumer.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumerStats {
+    /// When this consumer last subscribed.
+    #[serde(default)]
+    pub connected_since: String,
 }
 
 impl Cluster {
@@ -616,7 +630,7 @@ async fn wait_healthy(broker: usize) {
 
 /// Polls `check` every half second until it holds. Returns false if it still
 /// does not hold after `timeout`.
-async fn eventually<F, Fut>(timeout: Duration, mut check: F) -> bool
+pub(crate) async fn eventually<F, Fut>(timeout: Duration, mut check: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
@@ -631,13 +645,13 @@ where
     true
 }
 
-fn path(topic: &str) -> String {
+pub(crate) fn path(topic: &str) -> String {
     topic.replace("://", "/")
 }
 
 /// One client per test thread. Each `#[tokio::test]` runs its own runtime on
 /// its own thread, and a pooled connection cannot outlive its runtime.
-fn http() -> reqwest::Client {
+pub(crate) fn http() -> reqwest::Client {
     thread_local! {
         static HTTP: reqwest::Client = reqwest::Client::builder()
             .no_proxy()
@@ -648,7 +662,7 @@ fn http() -> reqwest::Client {
     HTTP.with(Clone::clone)
 }
 
-async fn docker_ok<S: AsRef<OsStr>>(args: &[S]) -> bool {
+pub(crate) async fn docker_ok<S: AsRef<OsStr>>(args: &[S]) -> bool {
     Command::new("docker")
         .args(args)
         .output()
@@ -657,7 +671,7 @@ async fn docker_ok<S: AsRef<OsStr>>(args: &[S]) -> bool {
 }
 
 /// The last lines a container wrote. Pulsar logs to both streams.
-async fn docker_logs(name: &str) -> String {
+pub(crate) async fn docker_logs(name: &str) -> String {
     match Command::new("docker")
         .args(["logs", "--tail", "40", name])
         .output()

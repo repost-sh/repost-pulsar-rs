@@ -1004,24 +1004,27 @@ impl<Exe: Executor> Connection<Exe> {
             return Ok(Connection { id, url, sender });
         }
 
-        let mut fatal_errors = vec![];
-        let mut retryable_errors = vec![];
-        for e in errors.into_iter() {
-            if e.establish_retryable() {
-                retryable_errors.push(e);
-            } else {
-                fatal_errors.push(e);
+        // A refused credential needs someone to act, whatever the other
+        // addresses did; otherwise an address worth trying again.
+        let refused = errors.iter().position(ConnectionError::refuses_credential);
+        let retryable = errors.iter().position(ConnectionError::establish_retryable);
+        match (refused, retryable) {
+            (Some(index), _) => {
+                error!("connection refused the credential: {:?}", errors);
+                Err(errors.swap_remove(index))
             }
-        }
-
-        if retryable_errors.is_empty() {
-            error!("connection error, not retryable: {:?}", fatal_errors);
-            Err(ConnectionError::Io(std::io::Error::other(
-                "fatal error when connecting to the Pulsar server",
-            )))
-        } else {
-            warn!("retry establish connection on: {:?}", retryable_errors);
-            Err(retryable_errors.into_iter().next().unwrap())
+            (None, Some(index)) => {
+                warn!("retry establish connection on: {:?}", errors);
+                Err(errors.swap_remove(index))
+            }
+            (None, None) => {
+                error!("connection error, not retryable: {:?}", errors);
+                Err(errors.into_iter().next().unwrap_or_else(|| {
+                    ConnectionError::Io(std::io::Error::other(
+                        "fatal error when connecting to the Pulsar server",
+                    ))
+                }))
+            }
         }
     }
 

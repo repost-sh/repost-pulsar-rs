@@ -63,7 +63,16 @@ enum InnerConsumer<T: DeserializeMessage, Exe: Executor> {
 ///     .await?;
 ///
 /// let mut counter = 0usize;
-/// while let Some(Ok(msg)) = consumer.next().await {
+/// while let Some(item) = consumer.next().await {
+///     // An error is not the end: the consumer keeps reconnecting, and hands
+///     // over what needs someone to act, a refused credential say.
+///     let msg = match item {
+///         Ok(msg) => msg,
+///         Err(e) => {
+///             log::error!("consumer error: {e}");
+///             continue;
+///         }
+///     };
 ///     consumer.ack(&msg).await?;
 ///     let data = match msg.deserialize() {
 ///         Ok(data) => data,

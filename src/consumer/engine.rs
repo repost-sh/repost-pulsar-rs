@@ -760,6 +760,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
         let mut acks = Vec::new();
         let mut attempt = 0;
+        let mut reported = false;
         loop {
             if self.tx.is_closed() {
                 return Err(Error::Consumer(ConsumerError::Closed));
@@ -824,6 +825,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         "consumer {}: reconnect failed, retrying in {delay:?}: {e}",
                         self.debug_format()
                     );
+                    // A refused credential needs someone to act: the application
+                    // hears it once an outage, and the consumer keeps trying
+                    // with whatever the provider hands out next.
+                    if !reported && e.needs_attention() {
+                        reported = true;
+                        let _ = self.deliver(Err(e));
+                    }
                     if !self.wait_disconnected(delay, &mut acks).await {
                         return Err(Error::Consumer(ConsumerError::Closed));
                     }

@@ -1046,6 +1046,11 @@ struct Pending {
     closed: bool,
     /// messages sent but not acknowledged yet, by sequence id, resent in order on re-creation
     messages: BTreeMap<u64, PendingMessage>,
+    /// why re-creating the producer failed last, given as the cause of what
+    /// times out meanwhile
+    last_failure: Option<Arc<Error>>,
+    /// re-creations failed in a row, which sets the backoff before the next
+    failed_attempts: u32,
 }
 
 struct PendingMessage {
@@ -1056,6 +1061,28 @@ struct PendingMessage {
 }
 
 impl Pending {
+    /// A timeout, with what kept the producer from being re-created if known.
+    fn timed_out(&self, message: &'static str) -> ConnectionError {
+        let kind = std::io::ErrorKind::TimedOut;
+        ConnectionError::Io(match &self.last_failure {
+            Some(cause) => std::io::Error::new(
+                kind,
+                error::TimedOutBecause {
+                    message,
+                    cause: cause.clone(),
+                },
+            ),
+            None => std::io::Error::new(kind, message),
+        })
+    }
+
+    /// Fails a message not acknowledged within `operation_timeout` of its
+    /// first send.
+    fn expire(&mut self, sequence_id: u64) {
+        let error = self.timed_out("the message was not acknowledged within the operation timeout");
+        self.complete(sequence_id, Err(ProducerError::Connection(error).into()));
+    }
+
     fn complete(&mut self, sequence_id: u64, result: Result<CommandSendReceipt, Error>) {
         if let Some(message) = self.messages.remove(&sequence_id) {
             let _ = message.tx.send(result);
@@ -1131,10 +1158,22 @@ impl<Exe: Executor> ProducerConnection<Exe> {
             let reconnected = self.spawn_reconnect(epoch)?;
             match self.wait_until(reconnected, deadline).await {
                 Some(Ok(Err(e))) if is_permanent(&e) => return Err(e),
-                Some(Ok(_)) => {} // re-created, or failed for now: try again
+                Some(Ok(Ok(()))) => {} // re-created: send again
+                // failed for now: try again, and give it as the cause if time runs out,
+                // unless a re-creation succeeded since
+                Some(Ok(Err(e))) => {
+                    let mut pending = self.pending.lock().unwrap();
+                    if pending.epoch == epoch {
+                        pending.last_failure = Some(Arc::new(e));
+                    }
+                }
                 Some(Err(oneshot::Canceled)) => return Err(Error::Executor),
                 None => {
-                    let error = timed_out("could not re-create the producer in time");
+                    let error = self
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .timed_out("could not re-create the producer in time");
                     return Err(ProducerError::Connection(error).into());
                 }
             }
@@ -1165,7 +1204,12 @@ impl<Exe: Executor> ProducerConnection<Exe> {
     ) -> Result<MutexGuard<'_, ProducerState<Exe>>, ConnectionError> {
         self.wait_until(self.state.lock(), deadline)
             .await
-            .ok_or_else(|| timed_out("timed out waiting for the producer to be re-created"))
+            .ok_or_else(|| {
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .timed_out("timed out waiting for the producer to be re-created")
+            })
     }
 
     /// Re-creates the producer in the background, unless another task did since `epoch`.
@@ -1201,7 +1245,15 @@ impl<Exe: Executor> ProducerConnection<Exe> {
         retry: bool,
     ) -> Result<(), Error> {
         loop {
-            match self.recreate(state).await {
+            let result = self.recreate(state).await;
+            {
+                let mut pending = self.pending.lock().unwrap();
+                pending.failed_attempts = match result {
+                    Ok(()) => 0,
+                    Err(_) => pending.failed_attempts.saturating_add(1),
+                };
+            }
+            match result {
                 Ok(()) => break,
                 Err(e) if is_permanent(&e) => {
                     let messages = std::mem::take(&mut self.pending.lock().unwrap().messages);
@@ -1224,6 +1276,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
                         "could not re-create producer {:?}({}) for topic {}, retrying: {:?}",
                         self.name, self.id, self.topic, e
                     );
+                    self.pending.lock().unwrap().last_failure = Some(Arc::new(e));
                 }
             }
         }
@@ -1238,8 +1291,9 @@ impl<Exe: Executor> ProducerConnection<Exe> {
                 .map(|(sequence_id, _)| *sequence_id)
                 .collect();
             for sequence_id in expired_ids {
-                pending.complete(sequence_id, Err(expired()));
+                pending.expire(sequence_id);
             }
+            pending.last_failure = None;
             let to_resend: Vec<(u64, Instant)> = pending
                 .messages
                 .iter()
@@ -1274,11 +1328,17 @@ impl<Exe: Executor> ProducerConnection<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn recreate(self: &Arc<Self>, state: &mut ProducerState<Exe>) -> Result<(), Error> {
         state.ready = false;
-        // Like the Java client's first backoff step, give the broker a moment (e.g. to finish
-        // unloading the topic), and do not spin if it keeps closing the producer (e.g. bookies
-        // down) or cannot be reached.
-        // shortcut: fixed delay, use an exponential backoff if that is not enough
-        self.client.executor.delay(Duration::from_millis(100)).await;
+        // Like the Java client's backoff from 100 ms, give the broker a moment (e.g. to finish
+        // unloading the topic), and back off if it keeps closing the producer (e.g. bookies
+        // down), cannot be reached, or refuses the credential. A second at most: the state
+        // lock is held meanwhile, and sends and close wait on it.
+        let attempt = self.pending.lock().unwrap().failed_attempts;
+        let delay = crate::connection_manager::backoff(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            attempt,
+        );
+        self.client.executor.delay(delay).await;
         let closed = self.pending.lock().unwrap().closed;
         if closed {
             return Err(ProducerError::Closed.into());
@@ -1397,7 +1457,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
     }
 
     fn expire(&self, sequence_id: u64) {
-        self.complete(sequence_id, Err(expired()));
+        self.pending.lock().unwrap().expire(sequence_id);
     }
 
     /// Closes the producer, which is then no longer re-created.
@@ -1409,18 +1469,6 @@ impl<Exe: Executor> ProducerConnection<Exe> {
         let connection = self.lock_state(deadline).await?.connection.clone();
         connection.sender().close_producer(self.id).await
     }
-}
-
-fn timed_out(message: &'static str) -> ConnectionError {
-    ConnectionError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
-}
-
-/// The error of a message not acknowledged within `operation_timeout` of its first send.
-fn expired() -> Error {
-    ProducerError::Connection(timed_out(
-        "the message was not acknowledged within the operation timeout",
-    ))
-    .into()
 }
 
 /// Errors after which re-creating the producer cannot succeed.

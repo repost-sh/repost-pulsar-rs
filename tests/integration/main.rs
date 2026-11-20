@@ -11,6 +11,8 @@
 #![recursion_limit = "256"]
 
 mod acks;
+mod auth;
+mod auth_broker;
 mod batch_acks;
 mod cluster;
 mod delivery;

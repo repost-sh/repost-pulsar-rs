@@ -51,16 +51,13 @@ impl From<ServiceDiscoveryError> for Error {
 }
 
 /// Broker errors that retrying a subscribe or a producer creation cannot fix.
-/// Unlike Java's isRetriableError, an authentication failure is one: token
-/// and basic auth send the same credentials on every attempt, so a consumer
-/// would retry for ever without a word. The application gets the error and
-/// can build the consumer again.
+/// An authentication failure is not one, as in Java's isRetriableError: the
+/// auth provider may hand out a valid credential on the next attempt.
 pub(crate) fn is_permanent(kind: ServerError) -> bool {
     matches!(
         kind,
         ServerError::TopicNotFound
             | ServerError::TopicTerminatedError
-            | ServerError::AuthenticationError
             | ServerError::AuthorizationError
             | ServerError::IncompatibleSchema
             | ServerError::NotAllowedError
@@ -80,13 +77,29 @@ impl Error {
     /// The error the broker answered with, if this error carries one.
     pub fn server_error(&self) -> Option<ServerError> {
         match self {
-            Error::Connection(ConnectionError::PulsarError(kind, _))
-            | Error::Consumer(ConsumerError::Connection(ConnectionError::PulsarError(kind, _)))
-            | Error::Producer(ProducerError::Connection(ConnectionError::PulsarError(kind, _)))
-            | Error::ServiceDiscovery(ServiceDiscoveryError::Query(kind, _)) => *kind,
-            Error::Consumer(ConsumerError::Topic { error, .. }) => error.server_error(),
+            Error::ServiceDiscovery(ServiceDiscoveryError::Query(kind, _)) => *kind,
+            _ => self.connection_error()?.server_error(),
+        }
+    }
+
+    /// The connection error inside, through every layer that wraps one.
+    fn connection_error(&self) -> Option<&ConnectionError> {
+        match self {
+            Error::Connection(e)
+            | Error::Consumer(ConsumerError::Connection(e))
+            | Error::Producer(ProducerError::Connection(e))
+            | Error::ServiceDiscovery(ServiceDiscoveryError::Connection(e)) => Some(e),
+            Error::Consumer(ConsumerError::Topic { error, .. }) => error.connection_error(),
+            Error::Producer(ProducerError::Batch(error)) => error.connection_error(),
             _ => None,
         }
+    }
+
+    /// Whether someone has to act for the client to get through: a credential
+    /// that the broker refused, or that the auth provider failed to make.
+    pub(crate) fn needs_attention(&self) -> bool {
+        self.connection_error()
+            .is_some_and(ConnectionError::refuses_credential)
     }
 }
 
@@ -161,6 +174,61 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// The error the broker answered with, also behind a timeout it caused.
+    pub fn server_error(&self) -> Option<ServerError> {
+        match self {
+            ConnectionError::PulsarError(kind, _) => *kind,
+            ConnectionError::Io(e) => e
+                .get_ref()?
+                .downcast_ref::<TimedOutBecause>()?
+                .cause
+                .server_error(),
+            _ => None,
+        }
+    }
+
+    /// Whether the broker refused the credential, or the auth provider failed
+    /// to make one; a passing provider failure is not it.
+    pub(crate) fn refuses_credential(&self) -> bool {
+        matches!(
+            self,
+            ConnectionError::PulsarError(Some(ServerError::AuthenticationError), _)
+                | ConnectionError::Authentication(AuthenticationError::Custom(_))
+        )
+    }
+
+    /// The same error again, for each task that waited on the connect that
+    /// failed with it.
+    pub(crate) fn for_waiter(&self) -> ConnectionError {
+        match self {
+            ConnectionError::PulsarError(kind, message) => {
+                ConnectionError::PulsarError(*kind, message.clone())
+            }
+            ConnectionError::Authentication(e) => ConnectionError::Authentication(e.clone()),
+            ConnectionError::Io(e) => ConnectionError::Io(
+                match e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<TimedOutBecause>())
+                {
+                    Some(timeout) => io::Error::new(
+                        e.kind(),
+                        TimedOutBecause {
+                            message: timeout.message,
+                            cause: timeout.cause.clone(),
+                        },
+                    ),
+                    None => io::Error::new(e.kind(), e.to_string()),
+                },
+            ),
+            ConnectionError::Disconnected => ConnectionError::Disconnected,
+            ConnectionError::SlowDown => ConnectionError::SlowDown,
+            ConnectionError::NotFound => ConnectionError::NotFound,
+            ConnectionError::Canceled => ConnectionError::Canceled,
+            ConnectionError::Shutdown => ConnectionError::Shutdown,
+            other => ConnectionError::Unexpected(other.to_string()),
+        }
+    }
+
     pub fn establish_retryable(&self) -> bool {
         match self {
             ConnectionError::Io(e) => {
@@ -171,6 +239,21 @@ impl ConnectionError {
         }
     }
 }
+
+/// A timeout with what caused it, which `server_error` reads through.
+#[derive(Debug)]
+pub(crate) struct TimedOutBecause {
+    pub(crate) message: &'static str,
+    pub(crate) cause: std::sync::Arc<Error>,
+}
+
+impl fmt::Display for TimedOutBecause {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}: {}", self.message, self.cause)
+    }
+}
+
+impl std::error::Error for TimedOutBecause {}
 
 impl From<io::Error> for ConnectionError {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
