@@ -162,6 +162,14 @@ impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
         self.consumer.last_message_ids().await
     }
 
+    /// Whether the topic, or any of its partitions, holds a message this
+    /// reader has not read yet.
+    // Java: Reader.hasMessageAvailable
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn has_message_available(&mut self) -> Result<bool, Error> {
+        self.consumer.has_message_available().await
+    }
+
     /// returns the current number of messages received
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn messages_received(&self) -> u64 {

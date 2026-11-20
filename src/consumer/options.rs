@@ -39,6 +39,17 @@ pub struct ConsumerOptions {
     /// Readers only, and not together with `start_message_id`.
     // Java: ReaderBuilder.startMessageFromRollbackDuration
     pub start_rollback: Option<Duration>,
+    /// Whether a reader starting at `start_message_id` reads that message
+    /// too (default false: from the one after it).
+    // Java: ReaderBuilder.startMessageIdInclusive
+    pub start_inclusive: bool,
+    /// Whether an ack of part of a batch reaches the broker, with the
+    /// batch's `ack_set`, so that a restart redelivers only the members not
+    /// acked yet. `None` is on, as in Java since Pulsar 4.0 (PIP-391). A broker without
+    /// `acknowledgmentAtBatchIndexLevelEnabled` ignores such acks, and then
+    /// redelivers the whole batch, as it does with this off.
+    // Java: ConsumerBuilder.enableBatchIndexAcknowledgment
+    pub batch_index_ack: Option<bool>,
 }
 
 impl ConsumerOptions {
@@ -82,6 +93,20 @@ impl ConsumerOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_initial_position(mut self, initial_position: InitialPosition) -> Self {
         self.initial_position = initial_position;
+        self
+    }
+
+    /// Turns batch-index acks on or off; see `batch_index_ack`.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_batch_index_ack(mut self, on: bool) -> Self {
+        self.batch_index_ack = Some(on);
+        self
+    }
+
+    /// Makes a reader that starts at a message id read that message too.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_start_inclusive(mut self, inclusive: bool) -> Self {
+        self.start_inclusive = inclusive;
         self
     }
 

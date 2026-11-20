@@ -4,43 +4,25 @@
 
 use std::time::Duration;
 
-use pulsar::{producer::ProducerOptions, Pulsar, TokioExecutor};
+use pulsar::{Consumer, ConsumerOptions, Pulsar, TokioExecutor};
 
 use crate::{
     cluster::{exclusive, topic},
-    delivery::{collect, earliest_consumer, take, Delivered, DEADLINE},
+    delivery::{
+        collect, earliest_consumer, earliest_consumer_with, publish_batched, take, Delivered,
+        DEADLINE,
+    },
 };
 
-/// Publishes `numbers` in batches of ten, one broker entry per batch.
-async fn publish_batched(
+/// A consumer of `topic` from its start that keeps a partly acked batch to
+/// itself, as clients without batch-index acks do.
+async fn without_batch_index_acks(
     pulsar: &Pulsar<TokioExecutor>,
     topic: &str,
-    numbers: std::ops::RangeInclusive<u64>,
-) {
-    let mut producer = pulsar
-        .producer()
-        .with_topic(topic)
-        .with_options(ProducerOptions {
-            batch_size: Some(10),
-            batch_timeout: Some(Duration::from_secs(60)),
-            ..Default::default()
-        })
-        .build()
-        .await
-        .expect("producer");
-    let mut receipts = Vec::new();
-    for number in numbers {
-        receipts.push(
-            producer
-                .send_non_blocking(number.to_string())
-                .await
-                .expect("send"),
-        );
-    }
-    producer.send_batch().await.expect("flush");
-    for receipt in receipts {
-        receipt.await.expect("receipt");
-    }
+    subscription: &str,
+) -> Consumer<String, TokioExecutor> {
+    let options = ConsumerOptions::default().with_batch_index_ack(false);
+    earliest_consumer_with(pulsar, topic, subscription, options).await
 }
 
 #[tokio::test]
@@ -51,7 +33,7 @@ async fn a_cumulative_ack_inside_a_batch_loses_none_of_the_rest() {
     let pulsar = cluster.client().await;
     publish_batched(&pulsar, &topic, 1..=20).await;
 
-    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let mut first = without_batch_index_acks(&pulsar, &topic, "batched").await;
     // Message 15 is the fifth of the second entry.
     let taken = take(&mut first, &mut Delivered::default(), 15).await;
     assert!(
@@ -81,7 +63,7 @@ async fn individually_acking_part_of_a_batch_loses_none_of_the_rest() {
     let pulsar = cluster.client().await;
     publish_batched(&pulsar, &topic, 1..=10).await;
 
-    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let mut first = without_batch_index_acks(&pulsar, &topic, "batched").await;
     let taken = take(&mut first, &mut Delivered::default(), 10).await;
     for message in &taken[..3] {
         first.ack(message).await.expect("ack");
@@ -160,6 +142,64 @@ async fn after_a_seek_into_a_batch_acking_the_rest_acks_the_entry() {
         consumer.ack(&message).await.expect("ack");
     }
     delivered.assert_exactly(&topic, 6..=10);
+    cluster
+        .wait_subscription(&topic, "batched", |s| s.msg_backlog == 0)
+        .await;
+}
+
+// Java: ConsumerImpl.receiveIndividualMessagesFromBatch skips the members the
+// broker's ack_set marks acked.
+#[tokio::test]
+async fn a_cumulative_ack_inside_a_batch_holds_across_a_restart() {
+    let cluster = exclusive().await;
+    let topic = topic("batch-index-cumulative");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish_batched(&pulsar, &topic, 1..=20).await;
+
+    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let taken = take(&mut first, &mut Delivered::default(), 15).await;
+    first.cumulative_ack(&taken[14]).await.expect("ack");
+    cluster
+        .wait_subscription(&topic, "batched", |s| s.msg_backlog == 1)
+        .await;
+    drop(first);
+
+    let mut second = earliest_consumer(&pulsar, &topic, "batched").await;
+    let mut delivered = Delivered::default();
+    collect(&mut second, &mut delivered, 5, DEADLINE).await;
+    delivered.assert_exactly(&topic, 16..=20);
+}
+
+#[tokio::test]
+async fn individually_acked_members_of_a_batch_stay_acked_across_a_restart() {
+    let cluster = exclusive().await;
+    let topic = topic("batch-index-individual");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish_batched(&pulsar, &topic, 1..=10).await;
+
+    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let taken = take(&mut first, &mut Delivered::default(), 10).await;
+    for message in &taken[7..] {
+        first.ack(message).await.expect("ack");
+    }
+    // the broker shows no state for a partly acked entry to wait for
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    drop(first);
+
+    // Even without batch-index acks of its own, a consumer skips the members
+    // acked before, and completes the entry once it acks the rest.
+    let mut second = without_batch_index_acks(&pulsar, &topic, "batched").await;
+    let mut delivered = Delivered::default();
+    let again = take(&mut second, &mut delivered, 7).await;
+    // and nothing more after them
+    collect(&mut second, &mut delivered, 7, DEADLINE).await;
+    delivered.assert_exactly(&topic, 1..=7);
+
+    for message in &again {
+        second.ack(message).await.expect("ack");
+    }
     cluster
         .wait_subscription(&topic, "batched", |s| s.msg_backlog == 0)
         .await;

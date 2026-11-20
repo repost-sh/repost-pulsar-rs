@@ -13,7 +13,9 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{DeadLetterPolicy, Delivery, EngineEvent, EngineMessage, Queued, Resume, Seek},
+        data::{
+            position, DeadLetterPolicy, Delivery, EngineEvent, EngineMessage, Queued, Resume, Seek,
+        },
         options::ConsumerOptions,
     },
     error::{self, ConsumerError},
@@ -49,6 +51,9 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Messages at or before this id are dropped, as the broker sends the entry
     /// a subscription restarts from again.
     start: Option<MessageIdData>,
+    /// When the first subscribe succeeded, which the configured rollback
+    /// counts from.
+    subscribed_at: Instant,
     /// Whether `Delivery::resume` is past waiting for the first queued message
     /// on this connection, which spares a lock per message.
     first_queued_known: bool,
@@ -89,6 +94,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         options: ConsumerOptions,
     ) -> ConsumerEngine<Exe> {
         let (event_tx, event_rx) = mpsc::unbounded();
+        let (start, first_queued_known) = {
+            let delivery = delivery.lock().unwrap();
+            (
+                start_filter(&delivery.resume),
+                matches!(delivery.resume, Resume::From(_) | Resume::After(_)),
+            )
+        };
         ConsumerEngine {
             client,
             connection,
@@ -101,8 +113,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             messages_rx: Some(messages_rx),
             delivery,
             epoch: 0,
-            start: None,
-            first_queued_known: false,
+            start,
+            subscribed_at: Instant::now(),
+            first_queued_known,
             engine_rx: Some(engine_rx),
             event_rx,
             event_tx,
@@ -341,12 +354,14 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     }
 
     /// What to send the broker for an ack of `id`. An ack of a batch member
-    /// would acknowledge the whole entry, so an individual ack waits until
-    /// every member is acked, and a cumulative ack in the middle of a batch
-    /// covers only the entry before it; the rest of that batch then comes
-    /// again after a restart. An id without a batch size is sent as it is.
-    // Java: PersistentAcknowledgmentsGroupingTracker.java:248 (cumulative),
-    // MessageIdAdvUtils.acknowledge and prevMessageId
+    /// without an `ack_set` would acknowledge the whole entry. With
+    /// batch-index acks, a partly acked batch is sent with its `ack_set`.
+    /// Without them, an individual ack waits until every member is acked,
+    /// and a cumulative ack in the middle of a batch covers only the entry
+    /// before it; the rest of that batch then comes again after a restart.
+    /// An id without a batch size is sent as it is.
+    // Java: PersistentAcknowledgmentsGroupingTracker.addAcknowledgment,
+    // doImmediateBatchIndexAck, MessageIdAdvUtils.acknowledge and prevMessageId
     fn ack_target(&mut self, id: MessageIdData, cumulative: bool) -> Option<MessageIdData> {
         let key = (id.ledger_id, id.entry_id);
         if cumulative {
@@ -361,10 +376,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let (Some(index), Some(size)) = (id.batch_index, id.batch_size) else {
             return Some(id);
         };
-        let acks = self
-            .batch_acks
-            .entry(key)
-            .or_insert_with(|| BatchAcks::new(size));
+        let acks = batch_acks_of(&mut self.batch_acks, key, size);
         if cumulative {
             acks.mark_up_to(index);
         } else {
@@ -373,6 +385,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         if acks.is_complete() {
             self.batch_acks.remove(&key);
             return Some(whole_entry(id));
+        }
+        if self.options.batch_index_ack != Some(false) {
+            return Some(MessageIdData {
+                ack_set: acks.ack_set(),
+                ..whole_entry(id)
+            });
         }
         if !cumulative {
             return None;
@@ -572,12 +590,27 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         };
 
         let batch_size = payload.metadata.num_messages_in_batch;
+        let entry = (message.message_id.ledger_id, message.message_id.entry_id);
         let payloads = if batch_size.is_some() {
             BatchedMessageIterator::new(message.message_id, payload)?.collect()
         } else {
             vec![(message.message_id, payload)]
         };
+        let acked_before = !message.ack_set.is_empty();
+        if let Some(size) = batch_size.filter(|_| acked_before) {
+            batch_acks_of(&mut self.batch_acks, entry, size).keep_only(&message.ack_set);
+        }
         for (message_id, payload) in payloads {
+            // The broker charged no permit for a member it reports acked.
+            if acked_before
+                && message_id
+                    .batch_index
+                    .is_some_and(|index| !is_set(&message.ack_set, index))
+            {
+                debug!("consumer engine: skipped {message_id:?}, acked before");
+                self.frame_accounted += 1;
+                continue;
+            }
             if let Some(start) = &self.start {
                 if is_at_or_before(&message_id, start) {
                     debug!(
@@ -585,10 +618,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     );
                     // the application never sees it, so it never acks it
                     if let (Some(index), Some(size)) = (message_id.batch_index, batch_size) {
-                        self.batch_acks
-                            .entry((message_id.ledger_id, message_id.entry_id))
-                            .or_insert_with(|| BatchAcks::new(size))
-                            .mark(index);
+                        batch_acks_of(&mut self.batch_acks, entry, size).mark(index);
                     }
                     self.refund_permit().await;
                     continue;
@@ -698,7 +728,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
-        let options = {
+        let (mut options, rollback) = {
             let mut delivery = self.delivery.lock().unwrap();
             delivery.epoch += 1;
             self.epoch = delivery.epoch;
@@ -715,29 +745,40 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 None => {}
             }
             let mut options = self.options.clone();
-            if self.options.durable == Some(false) {
+            let rollback = if self.options.durable == Some(false) {
                 // The broker applies a rollback on every subscribe, so the
                 // configured one goes only until delivery moved.
                 let (start_message_id, start, rollback) = match &delivery.resume {
                     Resume::Configured => (
                         self.options.start_message_id.clone(),
                         None,
-                        self.options.start_rollback,
+                        self.options
+                            .start_rollback
+                            .map(|rollback| Rollback::FromFirstSubscribe {
+                                at: self.subscribed_at,
+                                rollback,
+                            }),
                     ),
                     // The broker keeps the subscription across its own seek;
                     // a later reconnect may find it gone.
-                    Resume::Time(publish_time_ms) => {
-                        (None, None, seek.is_none().then(|| since(*publish_time_ms)))
+                    Resume::Time(publish_time_ms) => (
+                        None,
+                        None,
+                        seek.is_none()
+                            .then_some(Rollback::ToPublishTime(*publish_time_ms)),
+                    ),
+                    Resume::From(id) | Resume::After(id) => {
+                        (Some(id.clone()), start_filter(&delivery.resume), None)
                     }
-                    Resume::From(first) => (Some(first.clone()), before_in_entry(first), None),
-                    Resume::After(last) => (Some(last.clone()), Some(last.clone()), None),
                 };
                 options.start_message_id = start_message_id;
-                options.start_rollback = rollback;
                 self.start = start;
-            }
+                rollback
+            } else {
+                None
+            };
             self.first_queued_known = matches!(delivery.resume, Resume::From(_) | Resume::After(_));
-            options
+            (options, rollback)
         };
         // Another consumer may receive the partition until this one is back,
         // even after a seek, since the broker reconnects every consumer of the
@@ -765,6 +806,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             if self.tx.is_closed() {
                 return Err(Error::Consumer(ConsumerError::Closed));
             }
+            options.start_rollback = rollback.map(Rollback::now);
             match self.resubscribe(&options).await {
                 Ok(messages) => {
                     // Acks sent while disconnected go out before the permits,
@@ -1066,11 +1108,10 @@ impl BatchAcks {
     }
 
     fn mark(&mut self, member: i32) {
-        let Ok(member) = usize::try_from(member) else {
-            return;
-        };
-        if let Some(word) = self.unacked.get_mut(member / 64) {
-            *word &= !(1u64 << (member % 64));
+        if let Some((word, bit)) = bit_of(member) {
+            if let Some(word) = self.unacked.get_mut(word) {
+                *word &= !bit;
+            }
         }
     }
 
@@ -1093,6 +1134,42 @@ impl BatchAcks {
     fn is_complete(&self) -> bool {
         self.unacked.iter().all(|&word| word == 0)
     }
+
+    /// Forgets the members the broker's `ack_set` marks acked.
+    fn keep_only(&mut self, ack_set: &[i64]) {
+        for (index, word) in self.unacked.iter_mut().enumerate() {
+            *word &= ack_set.get(index).map_or(0, |&set| set as u64);
+        }
+    }
+
+    /// The members still unacked, as the protocol's `ack_set`.
+    fn ack_set(&self) -> Vec<i64> {
+        self.unacked.iter().map(|&word| word as i64).collect()
+    }
+}
+
+/// The acks kept for the batch entry `key` of `size` members.
+fn batch_acks_of(
+    batch_acks: &mut BTreeMap<(u64, u64), BatchAcks>,
+    key: (u64, u64),
+    size: i32,
+) -> &mut BatchAcks {
+    batch_acks
+        .entry(key)
+        .or_insert_with(|| BatchAcks::new(size))
+}
+
+/// The word and the bit of `index` in a protocol bit set such as `ack_set`.
+// Java: BitSet.valueOf(long[])
+fn bit_of(index: i32) -> Option<(usize, u64)> {
+    let index = usize::try_from(index).ok()?;
+    Some((index / 64, 1 << (index % 64)))
+}
+
+/// Whether `index` is set in a protocol bit set such as `ack_set`.
+fn is_set(bits: &[i64], index: i32) -> bool {
+    bit_of(index)
+        .is_some_and(|(word, bit)| bits.get(word).is_some_and(|&word| word as u64 & bit != 0))
 }
 
 /// The id of the entry `id` is in, without its place in a batch.
@@ -1105,19 +1182,40 @@ fn whole_entry(id: MessageIdData) -> MessageIdData {
     }
 }
 
-/// How long ago `publish_time_ms` was, and at least a millisecond, so a
-/// rollback to it is never empty.
-fn since(publish_time_ms: u64) -> Duration {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    now.saturating_sub(Duration::from_millis(publish_time_ms))
-        .max(Duration::from_millis(1))
+/// Where a non-durable subscription starts again by time. The protocol
+/// carries a rollback from the broker's now, so it is measured anew for every
+/// subscribe: time spent reconnecting must not move the start later.
+#[derive(Clone, Copy, Debug)]
+enum Rollback {
+    /// The configured rollback, from the first subscribe.
+    FromFirstSubscribe { at: Instant, rollback: Duration },
+    /// A seek by publish time, in milliseconds since the epoch.
+    ToPublishTime(u64),
 }
 
-/// Where `id` sits in delivery order.
-fn position(id: &MessageIdData) -> (u64, u64, i32) {
-    (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1))
+impl Rollback {
+    /// The rollback to ask for at `now`, which is `since_epoch` on the wall
+    /// clock.
+    fn at(self, now: Instant, since_epoch: Duration) -> Duration {
+        match self {
+            // A second early: the broker measured the first one from when the
+            // request reached it, and measures this one the same way.
+            Rollback::FromFirstSubscribe { at, rollback } => {
+                rollback + now.saturating_duration_since(at) + Duration::from_secs(1)
+            }
+            // at least a millisecond, so a rollback to it is never empty
+            Rollback::ToPublishTime(publish_time_ms) => since_epoch
+                .saturating_sub(Duration::from_millis(publish_time_ms))
+                .max(Duration::from_millis(1)),
+        }
+    }
+
+    fn now(self) -> Duration {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.at(Instant::now(), since_epoch)
+    }
 }
 
 /// Whether `id` was already delivered when the subscription restarts from
@@ -1138,6 +1236,28 @@ fn is_at_or_before(id: &MessageIdData, start: &MessageIdData) -> bool {
     }
 }
 
+/// Where a non-durable subscription configured to start at a message id
+/// resumes: after that message, or at it when inclusive, as if a seek had
+/// put it there.
+// Java: ConsumerImpl.isPriorEntryIndex and isPriorBatchIndex, resetIncludeHead
+pub(crate) fn configured_resume(options: &ConsumerOptions) -> Resume {
+    match (&options.start_message_id, options.durable) {
+        (Some(start), Some(false)) if options.start_inclusive => Resume::From(start.clone()),
+        (Some(start), Some(false)) => Resume::After(start.clone()),
+        _ => Resume::Configured,
+    }
+}
+
+/// What a subscription that resumes at `resume` drops of what the broker
+/// sends first: it starts from the whole entry of a message id.
+fn start_filter(resume: &Resume) -> Option<MessageIdData> {
+    match resume {
+        Resume::From(first) => before_in_entry(first),
+        Resume::After(last) => Some(last.clone()),
+        Resume::Configured | Resume::Time(_) => None,
+    }
+}
+
 /// The filter that keeps `first` and drops what precedes it in its entry,
 /// since the broker resends the whole entry. Nothing precedes a message that
 /// is not in a batch, or that opens one.
@@ -1148,4 +1268,37 @@ fn before_in_entry(first: &MessageIdData) -> Option<MessageIdData> {
         batch_index: Some(index - 1),
         ..first.clone()
     })
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use std::time::{Duration, Instant};
+
+    use super::Rollback;
+
+    #[test]
+    fn a_configured_rollback_keeps_its_start_however_late_the_subscribe() {
+        let first = Instant::now();
+        let rollback = Rollback::FromFirstSubscribe {
+            at: first,
+            rollback: Duration::from_secs(120),
+        };
+        // a minute of reconnecting later, the window still starts where the
+        // first subscribe put it, a little earlier at most
+        let asked = rollback.at(first + Duration::from_secs(60), Duration::ZERO);
+        assert!(
+            (Duration::from_secs(180)..=Duration::from_secs(182)).contains(&asked),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_time_seek_keeps_its_start_however_late_the_subscribe() {
+        let sought = 1_000_000;
+        let rollback = Rollback::ToPublishTime(sought);
+        for late in [5, 65] {
+            let now = Duration::from_millis(sought) + Duration::from_secs(late);
+            assert_eq!(rollback.at(Instant::now(), now), Duration::from_secs(late));
+        }
+    }
 }

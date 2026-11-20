@@ -136,3 +136,8 @@ pub struct DeadLetterPolicy {
     /// Name of the dead topic where the failing messages will be sent.
     pub dead_letter_topic: String,
 }
+
+/// Where `id` sits in delivery order.
+pub(crate) fn position(id: &MessageIdData) -> (u64, u64, i32) {
+    (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1))
+}

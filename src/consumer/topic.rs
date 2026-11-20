@@ -20,16 +20,16 @@ use crate::{
     consumer::{
         config::ConsumerConfig,
         data::{
-            DeadLetterPolicy, Delivery, EngineMessage, MessageData, MessageIdDataReceiver, Queued,
-            Resume, Seek,
+            position, DeadLetterPolicy, Delivery, EngineMessage, MessageData,
+            MessageIdDataReceiver, Queued, Resume, Seek,
         },
-        engine::ConsumerEngine,
+        engine::{configured_resume, ConsumerEngine},
         message::Message,
         message::{ConsumerEvent, ConsumerItem},
     },
     error::{ConnectionError, ConsumerError},
     message::proto::{MessageIdData, Schema},
-    proto::CommandConsumerStatsResponse,
+    proto::{self, CommandConsumerStatsResponse},
     retry_op::retry_subscribe_consumer,
     BrokerAddress, DeserializeMessage, Error, Executor, Payload, Pulsar,
 };
@@ -116,10 +116,10 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         }
         // Unbounded, because the permits already bound it.
         let (tx, rx) = mpsc::unbounded();
-        let delivery = Arc::new(Mutex::new(Delivery::new(
-            window,
-            unacked_message_redelivery_delay.is_some(),
-        )));
+        let delivery = Arc::new(Mutex::new(Delivery {
+            resume: configured_resume(&options),
+            ..Delivery::new(window, unacked_message_redelivery_delay.is_some())
+        }));
         let mut c = ConsumerEngine::new(
             client.clone(),
             connection.clone(),
@@ -358,12 +358,44 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         Ok(())
     }
 
+    /// Whether the topic holds a message the application has not taken yet:
+    /// one the broker has past the last the application took, or at the
+    /// first one queued, or else past the subscription's position. Messages
+    /// queued here count through the first two, so stale ones from before a
+    /// seek or reconnect do not.
+    // Java: ConsumerImpl.hasMessageAvailableAsync and hasMoreMessages
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn has_message_available(&mut self) -> Result<bool, Error> {
+        let resume = self.delivery.lock().unwrap().resume.clone();
+        let response = self.last_message_id_response().await?;
+        let last = response.last_message_id;
+        // The broker sends Java's longs: an empty topic answers entry -1.
+        if (last.entry_id as i64) < 0 {
+            return Ok(false);
+        }
+        Ok(match (&resume, response.consumer_mark_delete_position) {
+            (Resume::After(taken), _) => position(&last) > position(taken),
+            (Resume::From(first), _) => position(&last) >= position(first),
+            // -1 is "before the first entry"
+            (_, Some(cursor)) => {
+                (last.ledger_id as i64, last.entry_id as i64)
+                    > (cursor.ledger_id as i64, cursor.entry_id as i64)
+            }
+            (_, None) => true,
+        })
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn get_last_message_id(&mut self) -> Result<MessageIdData, Error> {
+        Ok(self.last_message_id_response().await?.last_message_id)
+    }
+
+    async fn last_message_id_response(
+        &mut self,
+    ) -> Result<proto::CommandGetLastMessageIdResponse, Error> {
         let consumer_id = self.consumer_id;
-        let conn = self.connection().await?;
-        let get_last_message_id_response = conn.sender().get_last_message_id(consumer_id).await?;
-        Ok(get_last_message_id_response.last_message_id)
+        let connection = self.connection().await?;
+        Ok(connection.sender().get_last_message_id(consumer_id).await?)
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]

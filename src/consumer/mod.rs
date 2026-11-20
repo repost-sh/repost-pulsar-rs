@@ -295,6 +295,20 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
+    /// Whether any topic or partition holds a message the application has not
+    /// taken yet.
+    // Java: MultiTopicsConsumerImpl.hasMessageAvailableAsync
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn has_message_available(&mut self) -> Result<bool, Error> {
+        let answers = try_join_all(
+            self.topic_consumers()
+                .into_iter()
+                .map(|consumer| consumer.has_message_available()),
+        )
+        .await?;
+        Ok(answers.into_iter().any(|available| available))
+    }
+
     /// The consumer of each topic or partition this consumer reads.
     fn topic_consumers(&mut self) -> Vec<&mut TopicConsumer<T, Exe>> {
         match &mut self.inner {

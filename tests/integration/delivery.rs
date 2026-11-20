@@ -9,6 +9,7 @@ pub const DEADLINE: Duration = Duration::from_secs(90);
 use futures::{Stream, StreamExt, TryStreamExt};
 use pulsar::{
     consumer::{InitialPosition, Message},
+    producer::ProducerOptions,
     reader::Reader,
     Consumer, ConsumerOptions, Error, Pulsar, SubType, TokioExecutor,
 };
@@ -46,11 +47,22 @@ pub async fn earliest_reader(
     topic: &str,
     subscription: &str,
 ) -> Reader<String, TokioExecutor> {
+    let options = ConsumerOptions::default().with_initial_position(InitialPosition::Earliest);
+    reader_with(pulsar, topic, subscription, options).await
+}
+
+/// A reader of `topic` with `options`.
+pub async fn reader_with(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+    subscription: &str,
+    options: ConsumerOptions,
+) -> Reader<String, TokioExecutor> {
     pulsar
         .reader()
         .with_topic(topic)
         .with_subscription(subscription)
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
+        .with_options(options)
         .into_reader()
         .await
         .expect("reader")
@@ -90,6 +102,38 @@ pub async fn publish(pulsar: &Pulsar<TokioExecutor>, topic: &str, numbers: Range
             .expect("send")
             .await
             .expect("receipt");
+    }
+}
+
+/// Publishes `numbers` in batches of ten, one broker entry per batch.
+pub async fn publish_batched(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+    numbers: RangeInclusive<u64>,
+) {
+    let mut producer = pulsar
+        .producer()
+        .with_topic(topic)
+        .with_options(ProducerOptions {
+            batch_size: Some(10),
+            batch_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("producer");
+    let mut receipts = Vec::new();
+    for number in numbers {
+        receipts.push(
+            producer
+                .send_non_blocking(number.to_string())
+                .await
+                .expect("send"),
+        );
+    }
+    producer.send_batch().await.expect("flush");
+    for receipt in receipts {
+        receipt.await.expect("receipt");
     }
 }
 
