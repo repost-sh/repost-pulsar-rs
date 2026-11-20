@@ -299,7 +299,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         // operation timeout, so a seek survives a broker failover. A seek
         // that failed would leave the reconnect's start filter in place.
         let deadline = std::time::Instant::now() + self.operation_timeout;
-        let mut delay = Duration::from_millis(100);
+        let mut retries = 0;
         let result = loop {
             // A reconnect may have taken the target meanwhile; the next
             // reconnect, after this attempt, needs it again.
@@ -319,8 +319,13 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             };
             match attempt {
                 Err(e) if may_succeed_later(&e) && std::time::Instant::now() < deadline => {
+                    let delay = crate::connection_manager::backoff(
+                        Duration::from_millis(100),
+                        Duration::from_secs(2),
+                        retries,
+                    );
                     self.executor.delay(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(2));
+                    retries += 1;
                 }
                 result => break result,
             }

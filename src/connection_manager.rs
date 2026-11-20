@@ -39,6 +39,28 @@ pub struct ConnectionRetryOptions {
     pub connection_max_idle: Duration,
 }
 
+impl ConnectionRetryOptions {
+    /// How long to wait before retry number `attempt`, counting from 0.
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
+        backoff(self.min_backoff, self.max_backoff, attempt)
+    }
+}
+
+/// How long to wait before retry number `attempt`, counting from 0: doubling
+/// from `min`, capped at `max`, then anywhere within a tenth of that and
+/// within the two bounds, so clients that lost a broker together do not
+/// retry together, at the cap too. Never less than a millisecond, so a zero
+/// minimum does not spin.
+// Java: Backoff.next takes up to a tenth off the capped delay
+pub(crate) fn backoff(min: Duration, max: Duration, attempt: u32) -> Duration {
+    let max = max.max(Duration::from_millis(1));
+    let min = min.max(Duration::from_millis(1)).min(max);
+    let delay = min.saturating_mul(2u32.saturating_pow(attempt)).min(max);
+    let low = delay.saturating_sub(delay / 10).max(min);
+    let high = delay.saturating_add(delay / 10).min(max);
+    low + (high - low).mul_f64(rand::thread_rng().gen_range(0.0..=1.0))
+}
+
 impl Default for ConnectionRetryOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn default() -> Self {
@@ -84,6 +106,34 @@ impl OperationRetryOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_stay_spread_out_within_the_backoff_bounds() {
+        let (min, max) = (Duration::from_millis(10), Duration::from_secs(30));
+        for (attempt, low, high) in [(0, min, min * 11 / 10), (30, max * 9 / 10, max)] {
+            let delays: Vec<Duration> = (0..200).map(|_| backoff(min, max, attempt)).collect();
+            assert!(
+                delays.iter().all(|d| (low..=high).contains(d)),
+                "{delays:?}"
+            );
+            // no clump on a bound, where clients would retry together again
+            let on_a_bound = delays.iter().filter(|d| **d == low || **d == high).count();
+            assert!(on_a_bound < 20, "{on_a_bound} of 200 on a bound");
+        }
+    }
+
+    #[test]
+    fn odd_backoff_bounds_neither_spin_nor_overflow() {
+        // a minimum above the maximum does not stretch the wait past it
+        assert!(
+            backoff(Duration::from_secs(2), Duration::from_millis(500), 0)
+                <= Duration::from_millis(500)
+        );
+        // no cap at all does not overflow
+        backoff(Duration::from_millis(10), Duration::MAX, 100);
+        // a zero minimum still waits
+        assert!(backoff(Duration::ZERO, Duration::from_secs(30), 0) > Duration::ZERO);
+    }
 
     #[test]
     fn test_allow_retry_no_max_retries() {
@@ -351,18 +401,6 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self.connection_retry_options
     }
 
-    /// How long to wait before retry number `attempt` (counting from 0): an
-    /// exponential backoff from `min_backoff`, capped at `max_backoff`, plus
-    /// jitter so clients that lost a broker together do not retry together.
-    pub(crate) fn backoff(&self, attempt: u32) -> std::time::Duration {
-        let options = &self.connection_retry_options;
-        let jitter = rand::thread_rng().gen_range(0..10);
-        std::cmp::min(
-            options.min_backoff * 2u32.saturating_pow(attempt) + options.min_backoff * jitter,
-            options.max_backoff,
-        )
-    }
-
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn connect_inner(
         &self,
@@ -402,7 +440,6 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             None
         };
 
-        let mut current_backoff;
         let mut current_retries = 0u32;
 
         let start = std::time::Instant::now();
@@ -427,15 +464,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                         return Err(e);
                     }
 
-                    current_backoff = self.backoff(current_retries);
+                    let current_backoff = self.connection_retry_options.backoff(current_retries);
                     current_retries += 1;
-
-                    trace!(
-                        "current retries: {}, current_backoff(pow = {}): {}ms",
-                        current_retries,
-                        2u32.pow(current_retries - 1),
-                        current_backoff.as_millis()
-                    );
                     error!(
                         "connection error, retrying connection to {} after {}ms",
                         broker.url,

@@ -51,6 +51,10 @@ impl From<ServiceDiscoveryError> for Error {
 }
 
 /// Broker errors that retrying a subscribe or a producer creation cannot fix.
+/// Unlike Java's isRetriableError, an authentication failure is one: token
+/// and basic auth send the same credentials on every attempt, so a consumer
+/// would retry for ever without a word. The application gets the error and
+/// can build the consumer again.
 pub(crate) fn is_permanent(kind: ServerError) -> bool {
     matches!(
         kind,
@@ -65,7 +69,6 @@ pub(crate) fn is_permanent(kind: ServerError) -> bool {
 }
 
 impl Error {
-    /// The error the broker answered with, if this error carries one.
     /// The error alone, without the topic a consumer tags it with.
     pub fn without_topic(&self) -> &Error {
         match self {
@@ -74,6 +77,7 @@ impl Error {
         }
     }
 
+    /// The error the broker answered with, if this error carries one.
     pub fn server_error(&self) -> Option<ServerError> {
         match self {
             Error::Connection(ConnectionError::PulsarError(kind, _))

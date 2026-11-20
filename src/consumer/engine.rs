@@ -787,7 +787,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                             return Ok(());
                         }
                         Err(e) => {
-                            let delay = self.client.manager.backoff(attempt);
+                            let delay = self
+                                .client
+                                .manager
+                                .connection_retry_options()
+                                .backoff(attempt);
                             attempt += 1;
                             warn!(
                                 "consumer {}: flow after reconnect failed, retrying in {delay:?}: {e}",
@@ -810,7 +814,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     return Err(Error::Consumer(ConsumerError::Closed));
                 }
                 Err(e) => {
-                    let delay = self.client.manager.backoff(attempt);
+                    let delay = self
+                        .client
+                        .manager
+                        .connection_retry_options()
+                        .backoff(attempt);
                     attempt += 1;
                     warn!(
                         "consumer {}: reconnect failed, retrying in {delay:?}: {e}",
