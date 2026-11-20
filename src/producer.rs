@@ -32,7 +32,7 @@ use crate::{
         BatchedMessage,
     },
     proto::CommandSuccess,
-    retry_op::retry_create_producer,
+    retry_op::{create_producer_once, retry_create_producer},
     routing_policy::{HashingScheme, RoutingPolicy},
     service_discovery::{full_topic_name, partition_name},
     BrokerAddress, Error, Pulsar,
@@ -754,18 +754,8 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
         let topic = topic.clone();
         let compression = options.compression.clone();
-        let mut connection = client.manager.get_connection(&addr).await?;
-
-        let (producer_name, schema_version) = retry_create_producer(
-            &client,
-            &mut connection,
-            addr,
-            &topic,
-            producer_id,
-            name,
-            &options,
-        )
-        .await?;
+        let (connection, (producer_name, schema_version)) =
+            retry_create_producer(&client, addr, &topic, producer_id, name, &options).await?;
         let connection = Arc::new(ProducerConnection {
             client: client.clone(),
             topic: topic.clone(),
@@ -1356,11 +1346,16 @@ impl<Exe: Executor> ProducerConnection<Exe> {
                 self.name, self.id, self.topic, e
             );
         }
-        let broker_address = self.client.lookup_topic(&self.topic).await?;
-        let (_producer_name, schema_version) = retry_create_producer(
-            &self.client,
-            &mut state.connection,
-            broker_address,
+        // One attempt at each step: reconnect() backs off between attempts, and the state lock
+        // is held meanwhile.
+        let broker_address = self.client.lookup_topic_once(&self.topic).await?;
+        state.connection = self
+            .client
+            .manager
+            .get_connection_retrying(&broker_address, 0)
+            .await?;
+        let (_producer_name, schema_version) = create_producer_once(
+            &state.connection,
             &self.topic,
             self.id,
             Some(self.name.clone()),
@@ -1474,9 +1469,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
 /// Errors after which re-creating the producer cannot succeed.
 fn is_permanent(error: &Error) -> bool {
     matches!(error, Error::Producer(ProducerError::Closed))
-        || error.server_error().is_some_and(|kind| {
-            kind == proto::ServerError::ProducerFenced || error::is_permanent(kind)
-        })
+        || error.server_error().is_some_and(error::is_permanent)
 }
 
 impl<Exe: Executor> std::ops::Drop for TopicProducer<Exe> {

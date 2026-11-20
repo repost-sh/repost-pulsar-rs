@@ -825,6 +825,9 @@ impl<Exe: Executor> ConnectionSender<Exe> {
                     res
                 }
                 Either::Right(_) => {
+                    // An unanswered request may be a half-open connection:
+                    // everyone on it moves to a new one rather than wait for
+                    // a ping to fail. One slow answer costs a reconnect.
                     warn!(
                         "connection {} timedout sending message to the Pulsar server",
                         connection_id
@@ -1446,7 +1449,7 @@ impl<Exe: Executor> Connection<Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn error(&self) -> Option<ConnectionError> {
-        self.sender.error.remove()
+        self.sender.error.get()
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -2026,7 +2029,7 @@ mod tests {
         )));
 
         if error.is_set() {
-            panic!("{:?}", error.remove())
+            panic!("{:?}", error.get())
         }
 
         match tokio::time::timeout(Duration::from_secs(1), auth_challenge_rx.next()).await {

@@ -80,9 +80,12 @@ impl Default for ConnectionRetryOptions {
 pub struct OperationRetryOptions {
     /// time limit to receive an answer to a Pulsar operation
     pub operation_timeout: Duration,
-    /// delay between operation retries after a ServiceNotReady error
+    /// The first wait before retrying an operation that failed in a way a
+    /// retry can fix; it doubles up to the connection's `max_backoff`, within
+    /// `operation_timeout` (default 100 ms, as Java's first backoff step).
     pub retry_delay: Duration,
-    /// maximum number of operation retries. None indicates infinite retries
+    /// The most retries of an operation, within `operation_timeout` either
+    /// way. None: as many as fit in the timeout.
     pub max_retries: Option<u32>,
 }
 
@@ -91,13 +94,30 @@ impl Default for OperationRetryOptions {
     fn default() -> Self {
         OperationRetryOptions {
             operation_timeout: Duration::from_secs(30),
-            retry_delay: Duration::from_secs(5),
+            retry_delay: Duration::from_millis(100),
             max_retries: None,
         }
     }
 }
 
 impl OperationRetryOptions {
+    /// How long to wait before retry number `attempt` of an operation that
+    /// started at `start`, or `None` when its time or its retries are up. The
+    /// wait never runs past the operation timeout.
+    // Java: Backoff with the operation timeout as its mandatory stop
+    pub(crate) fn next_delay(
+        &self,
+        start: std::time::Instant,
+        attempt: u32,
+        max_backoff: Duration,
+    ) -> Option<Duration> {
+        let left = self.operation_timeout.checked_sub(start.elapsed())?;
+        if left.is_zero() || !self.allow_retry(attempt) {
+            return None;
+        }
+        Some(backoff(self.retry_delay, max_backoff, attempt).min(left))
+    }
+
     pub fn allow_retry(&self, current: u32) -> bool {
         self.max_retries.is_none() || current < self.max_retries.unwrap()
     }
@@ -518,7 +538,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 {
                     // each waiter learns why, a refused credential say
                     for tx in v.drain(..) {
-                        let _ = tx.send(Err(e.for_waiter()));
+                        let _ = tx.send(Err(e.duplicate()));
                     }
                 }
 

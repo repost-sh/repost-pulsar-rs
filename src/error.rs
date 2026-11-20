@@ -1,11 +1,5 @@
 //! Error types
-use std::{
-    fmt, io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-};
+use std::{fmt, io, sync::Arc};
 
 use crate::{message::proto::ServerError, producer::SendFuture};
 
@@ -50,8 +44,38 @@ impl From<ServiceDiscoveryError> for Error {
     }
 }
 
-/// Broker errors that retrying a subscribe or a producer creation cannot fix.
-/// An authentication failure is not one, as in Java's isRetriableError: the
+/// What an operation is doing when it fails, which decides what is retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// Creating a consumer or producer, or looking a topic up for that.
+    Create,
+    /// Getting back what was created: after a reconnect, a seek, a re-creation.
+    Reconnect,
+}
+
+/// Whether an operation the broker answered with `kind` may succeed if tried
+/// again soon. A busy consumer or producer, and a few more answers, are worth
+/// waiting out only for what was created already: at creation the other one
+/// holds it on purpose.
+// Java: PulsarClientException.isRetriableError, which a reconnect ignores
+// once subscribeFuture is done
+fn retriable_answer(kind: ServerError, phase: Phase) -> bool {
+    !is_permanent(kind)
+        && (phase == Phase::Reconnect
+            || !matches!(
+                kind,
+                ServerError::ConsumerBusy
+                    | ServerError::ProducerBusy
+                    | ServerError::SubscriptionNotFound
+                    | ServerError::UnsupportedVersionError
+                    | ServerError::ChecksumError
+                    | ServerError::ConsumerAssignError
+                    | ServerError::TransactionConflict
+            ))
+}
+
+/// Broker errors that no retry can fix, at creation or after it. An
+/// authentication failure is not one, as in Java's isRetriableError: the
 /// auth provider may hand out a valid credential on the next attempt.
 pub(crate) fn is_permanent(kind: ServerError) -> bool {
     matches!(
@@ -62,6 +86,7 @@ pub(crate) fn is_permanent(kind: ServerError) -> bool {
             | ServerError::IncompatibleSchema
             | ServerError::NotAllowedError
             | ServerError::InvalidTopicName
+            | ServerError::ProducerFenced
     )
 }
 
@@ -92,6 +117,15 @@ impl Error {
             Error::Consumer(ConsumerError::Topic { error, .. }) => error.connection_error(),
             Error::Producer(ProducerError::Batch(error)) => error.connection_error(),
             _ => None,
+        }
+    }
+
+    /// Whether an operation that failed with this may succeed if tried again
+    /// soon.
+    pub(crate) fn may_retry(&self, phase: Phase) -> bool {
+        match self {
+            Error::ServiceDiscovery(e) => e.may_retry(phase),
+            _ => self.connection_error().is_some_and(|e| e.may_retry(phase)),
         }
     }
 
@@ -187,6 +221,53 @@ impl ConnectionError {
         }
     }
 
+    /// Whether an operation that failed with this may succeed if tried again
+    /// soon: a passing broker answer, or any trouble on the network. Java
+    /// retries every network error; what no retry fixes is a broken
+    /// configuration or protocol, and a client that is shutting down.
+    pub(crate) fn may_retry(&self, phase: Phase) -> bool {
+        match self {
+            ConnectionError::PulsarError(kind, _) => {
+                kind.is_some_and(|kind| retriable_answer(kind, phase))
+            }
+            ConnectionError::Unexpected(_)
+            | ConnectionError::Decoding(_)
+            | ConnectionError::Encoding(_)
+            | ConnectionError::UnexpectedResponse(_)
+            | ConnectionError::Tls(_)
+            | ConnectionError::NotFound
+            | ConnectionError::Shutdown => false,
+            #[allow(unreachable_patterns)]
+            _ => !self.is_configuration_error(),
+        }
+    }
+
+    /// Errors in how the client is set up, which no retry fixes.
+    fn is_configuration_error(&self) -> bool {
+        if let ConnectionError::Io(e) = self {
+            return matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput
+                    | io::ErrorKind::InvalidData
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+            );
+        }
+        #[cfg(all(
+            any(
+                feature = "tokio-rustls-runtime-aws-lc-rs",
+                feature = "tokio-rustls-runtime-ring",
+                feature = "async-std-rustls-runtime-aws-lc-rs",
+                feature = "async-std-rustls-runtime-ring",
+            ),
+            not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+        ))]
+        if matches!(self, ConnectionError::DnsName(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Whether the broker refused the credential, or the auth provider failed
     /// to make one; a passing provider failure is not it.
     pub(crate) fn refuses_credential(&self) -> bool {
@@ -197,9 +278,9 @@ impl ConnectionError {
         )
     }
 
-    /// The same error again, for each task that waited on the connect that
-    /// failed with it.
-    pub(crate) fn for_waiter(&self) -> ConnectionError {
+    /// The same error again: for each task that waited on the connect that
+    /// failed with it, and for each reader of a broken connection's error.
+    pub(crate) fn duplicate(&self) -> ConnectionError {
         match self {
             ConnectionError::PulsarError(kind, message) => {
                 ConnectionError::PulsarError(*kind, message.clone())
@@ -562,6 +643,19 @@ pub enum ServiceDiscoveryError {
     Dummy,
 }
 
+impl ServiceDiscoveryError {
+    /// Whether a lookup that failed with this may succeed if tried again soon.
+    pub(crate) fn may_retry(&self, phase: Phase) -> bool {
+        match self {
+            ServiceDiscoveryError::Query(kind, _) => {
+                kind.is_some_and(|kind| retriable_answer(kind, phase))
+            }
+            ServiceDiscoveryError::Connection(e) => e.may_retry(phase),
+            _ => false,
+        }
+    }
+}
+
 impl From<ConnectionError> for ServiceDiscoveryError {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn from(err: ConnectionError) -> Self {
@@ -671,37 +765,34 @@ impl From<AdminError> for Error {
 
 #[derive(Clone)]
 pub(crate) struct SharedError {
-    error_set: Arc<AtomicBool>,
-    error: Arc<Mutex<Option<ConnectionError>>>,
+    /// The first error of a connection, which then stays broken for every
+    /// consumer and producer on it, and for the connection manager.
+    error: Arc<std::sync::OnceLock<ConnectionError>>,
 }
 
 impl SharedError {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn new() -> SharedError {
         SharedError {
-            error_set: Arc::new(AtomicBool::new(false)),
-            error: Arc::new(Mutex::new(None)),
+            error: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn is_set(&self) -> bool {
-        self.error_set.load(Ordering::Relaxed)
+        self.error.get().is_some()
     }
 
+    /// The error, left in place.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn remove(&self) -> Option<ConnectionError> {
-        let mut lock = self.error.lock().unwrap();
-        let error = lock.take();
-        self.error_set.store(false, Ordering::Release);
-        error
+    pub fn get(&self) -> Option<ConnectionError> {
+        self.error.get().map(ConnectionError::duplicate)
     }
 
+    /// Records why the connection broke; the first reason stays.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn set(&self, error: ConnectionError) {
-        let mut lock = self.error.lock().unwrap();
-        *lock = Some(error);
-        self.error_set.store(true, Ordering::Release);
+        let _ = self.error.set(error);
     }
 }
 
@@ -735,5 +826,23 @@ pub(crate) fn server_error(i: i32) -> Option<ServerError> {
         24 => Some(ServerError::TransactionNotFound),
         25 => Some(ServerError::ProducerFenced),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod shared_error_tests {
+    use super::{ConnectionError, SharedError};
+
+    #[test]
+    fn a_connection_error_stays_for_every_reader() {
+        let error = SharedError::new();
+        error.set(ConnectionError::Disconnected);
+        for _ in 0..2 {
+            assert!(matches!(error.get(), Some(ConnectionError::Disconnected)));
+            assert!(
+                error.is_set(),
+                "reading the error made the connection valid"
+            );
+        }
     }
 }

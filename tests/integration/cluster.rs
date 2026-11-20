@@ -475,6 +475,36 @@ impl Cluster {
             .ok_or_else(|| format!("unknown broker {}", lookup.broker_url))
     }
 
+    /// Moves `topic` to `broker`, by unloading its bundle there, and waits
+    /// until it owns it.
+    pub async fn move_to(&self, topic: &str, broker: usize) {
+        let name = topic.trim_start_matches("persistent://");
+        let namespace = name.rsplit_once('/').expect("tenant/namespace/topic").0;
+        let bundle = self
+            .web(
+                reqwest::Method::GET,
+                &format!("lookup/v2/topic/persistent/{name}/bundle"),
+                None,
+            )
+            .await
+            .and_then(|response| response.error_for_status().map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| panic!("bundle of {topic}: {e}"))
+            .text()
+            .await
+            .expect("bundle range");
+        let bundle = bundle.trim().trim_matches('"');
+        self.admin(
+            reqwest::Method::PUT,
+            &format!(
+                "namespaces/{namespace}/{bundle}/unload?destinationBroker=127.0.0.1:{}",
+                8080 + broker
+            ),
+            None,
+        )
+        .await;
+        self.wait_owner(topic, broker).await;
+    }
+
     /// Waits until `topic` is owned by `broker`. After a kill, ownership moves
     /// only once the dead broker's metadata session expires.
     pub async fn wait_owner(&self, topic: &str, broker: usize) {

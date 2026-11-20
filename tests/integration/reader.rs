@@ -180,6 +180,8 @@ async fn a_reader_keeps_its_time_seek_across_a_later_reconnect() {
     // before the unload makes the broker create its subscription again.
     let now = chrono::Utc::now().timestamp_millis() as u64;
     reader.seek(None, Some(now)).await.expect("seek");
+    // the seek's own reconnect first: this test is about a later one
+    tokio::time::sleep(Duration::from_secs(1)).await;
     cluster.unload(&topic).await;
     cluster
         .wait_subscription(&topic, "reader", |s| !s.consumers.is_empty())

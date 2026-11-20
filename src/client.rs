@@ -346,7 +346,7 @@ impl<Exe: Executor> Pulsar<Exe> {
     /// that will retry the whole lookup itself.
     pub(crate) async fn lookup_topic_once(&self, topic: &str) -> Result<BrokerAddress, Error> {
         self.service_discovery
-            .lookup_topic_retrying(topic, 0)
+            .lookup_topic_once(topic)
             .await
             .map_err(|e| e.into())
     }

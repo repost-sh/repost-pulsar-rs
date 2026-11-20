@@ -1,84 +1,80 @@
-use std::{io::ErrorKind, sync::Arc, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 
 use futures::channel::mpsc::{self, UnboundedReceiver};
 
 use crate::{
     connection::Connection,
-    error::{ConnectionError, ConsumerError},
+    error::{ConnectionError, ConsumerError, Phase},
     message::Message,
-    proto, BrokerAddress, ConsumerOptions, Error, Executor, ProducerOptions, Pulsar, SubType,
+    BrokerAddress, ConsumerOptions, Error, Executor, ProducerOptions, Pulsar, SubType,
 };
 
-pub async fn handle_retry_error<Exe: Executor>(
+/// Runs `operation` on the broker that owns `topic` until it succeeds, fails
+/// in a way no retry can fix, or the operation timeout passes. The first try
+/// uses `addr`; later ones look the topic up again, as it may have moved.
+/// Every look-up and connect is a single attempt: this loop alone backs off.
+// Java: ConnectionHandler.grabCnx and reconnectLater, isRetriableError
+pub(crate) async fn with_retries<Exe, T, F, Fut>(
     client: &Pulsar<Exe>,
-    connection: &mut Arc<Connection<Exe>>,
-    addr: &mut BrokerAddress,
+    addr: BrokerAddress,
     topic: &str,
-    operation_name: &str,
-    current_retries: u32,
-    err: ConnectionError,
-) -> Result<(), Error> {
-    let operation_retry_options = &client.operation_retry_options;
-    let (kind, text) = match err {
-        ConnectionError::PulsarError(Some(kind), ref text)
-            if matches!(
-                kind,
-                proto::ServerError::ServiceNotReady
-                    | proto::ServerError::ConsumerBusy
-                    | proto::ServerError::ProducerBusy
-                    | proto::ServerError::ProducerBlockedQuotaExceededError
-                    | proto::ServerError::ProducerBlockedQuotaExceededException
-            ) =>
-        {
-            (
-                kind.as_str_name().to_owned(),
-                text.as_ref()
-                    .map(|text| format!(" (\"{text}\")"))
-                    .unwrap_or_default(),
-            )
+    what: &str,
+    mut operation: F,
+) -> Result<(Arc<Connection<Exe>>, T), Error>
+where
+    Exe: Executor,
+    F: FnMut(Arc<Connection<Exe>>) -> Fut,
+    Fut: Future<Output = Result<T, ConnectionError>>,
+{
+    let options = &client.operation_retry_options;
+    let max_backoff = client.manager.connection_retry_options().max_backoff;
+    let start = Instant::now();
+    let mut addr = Some(addr);
+    let mut attempt = 0;
+    loop {
+        let result = async {
+            let addr = match addr.take() {
+                Some(addr) => addr,
+                None => client.lookup_topic_once(topic).await?,
+            };
+            let connection = client.manager.get_connection_retrying(&addr, 0).await?;
+            let value = operation(connection.clone()).await?;
+            Ok::<_, Error>((connection, value))
         }
-        ConnectionError::Io(ref kind)
-            if matches!(
-                kind.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::NotConnected
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Interrupted
-                    | ErrorKind::UnexpectedEof
-            ) =>
-        {
-            (kind.kind().to_string(), "".to_owned())
-        }
-        err => {
-            error!("{operation_name}({topic}) error: {err:?}");
-            return Err(err.into());
-        }
-    };
-    if !(operation_retry_options.allow_retry(current_retries)) {
-        error!("{operation_name}({topic}) answered {kind}{text}, reached max retries");
-        return Err(err.into());
-    }
-    error!(
-        "{operation_name}({topic}) answered {kind}{text}, retrying request after {:?} (max_retries = {:?})",
-        operation_retry_options.retry_delay,
-        operation_retry_options.max_retries
-    );
-    client
-        .executor
-        .delay(operation_retry_options.retry_delay)
         .await;
-
-    *addr = client.lookup_topic(topic).await?;
-    *connection = client.manager.get_connection(addr).await?;
-    Ok(())
+        let error = match result {
+            Ok(done) => {
+                if attempt > 0 {
+                    info!(
+                        "{what}({topic}) succeeded after {} tries over {:?}",
+                        attempt + 1,
+                        start.elapsed()
+                    );
+                }
+                return Ok(done);
+            }
+            Err(error) => error,
+        };
+        let delay = error
+            .may_retry(Phase::Create)
+            .then(|| options.next_delay(start, attempt, max_backoff))
+            .flatten();
+        let Some(delay) = delay else {
+            error!("{what}({topic}) failed: {error}");
+            return Err(error);
+        };
+        warn!("{what}({topic}) failed, retrying in {delay:?}: {error}");
+        client.executor.delay(delay).await;
+        attempt += 1;
+    }
 }
 
+/// Subscribes to `topic`, retrying as [`with_retries`] does, and grants the
+/// broker its first `window` permits.
+#[allow(clippy::too_many_arguments)]
 pub async fn retry_subscribe_consumer<Exe: Executor>(
     client: &Pulsar<Exe>,
-    connection: &mut Arc<Connection<Exe>>,
-    mut addr: BrokerAddress,
+    addr: BrokerAddress,
     topic: &str,
     subscription: &str,
     sub_type: SubType,
@@ -86,55 +82,23 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
     consumer_name: &Option<String>,
     options: &ConsumerOptions,
     window: u32,
-) -> Result<UnboundedReceiver<Message>, Error> {
-    *connection = client.manager.get_connection(&addr).await?;
-    let mut current_retries = 0u32;
-    let start = Instant::now();
-
-    let messages = loop {
-        warn!(
-            "Retry #{current_retries} -> connecting consumer {consumer_id} using connection {:#} to broker {:#} to topic {topic}",
-            connection.id(),
-            addr.url,
-        );
-        match subscribe_once(
-            connection,
-            topic,
-            subscription,
-            sub_type,
-            consumer_id,
-            consumer_name,
-            options,
-        )
-        .await
-        {
-            Ok(messages) => {
-                if current_retries > 0 {
-                    let dur = (Instant::now() - start).as_secs();
-                    info!(
-                        "TopicConsumer::subscribe({topic}) success after {} retries over {dur} seconds",
-                        current_retries + 1,
-                    );
-                }
-                break messages;
-            }
-            Err(err) => {
-                handle_retry_error(
-                    client,
-                    connection,
-                    &mut addr,
-                    topic,
-                    "TopicConsumer::subscribe",
-                    current_retries,
-                    err,
-                )
-                .await?
-            }
-        }
-        current_retries += 1;
-    };
-    send_initial_flow(connection, topic, consumer_id, window).await?;
-    Ok(messages)
+) -> Result<(Arc<Connection<Exe>>, UnboundedReceiver<Message>), Error> {
+    let (connection, messages) =
+        with_retries(client, addr, topic, "subscribe", |connection| async move {
+            subscribe_once(
+                &connection,
+                topic,
+                subscription,
+                sub_type,
+                consumer_id,
+                consumer_name,
+                options,
+            )
+            .await
+        })
+        .await?;
+    send_initial_flow(&connection, topic, consumer_id, window).await?;
+    Ok((connection, messages))
 }
 
 /// Sends one subscribe request on `connection`, and returns where the
@@ -181,98 +145,80 @@ pub async fn send_initial_flow<Exe: Executor>(
         })
 }
 
+/// Creates a producer on `topic`, retrying as [`with_retries`] does, and
+/// returns its connection, name and schema version.
 pub async fn retry_create_producer<Exe: Executor>(
     client: &Pulsar<Exe>,
-    connection: &mut Arc<Connection<Exe>>,
-    mut addr: BrokerAddress,
-    topic: &String,
+    addr: BrokerAddress,
+    topic: &str,
     producer_id: u64,
     producer_name: Option<String>,
     options: &ProducerOptions,
-) -> Result<(String, Option<Vec<u8>>), Error> {
-    *connection = client.manager.get_connection(&addr).await?;
-    let mut current_retries = 0u32;
-    let start = Instant::now();
+) -> Result<(Arc<Connection<Exe>>, (String, Option<Vec<u8>>)), Error> {
+    with_retries(client, addr, topic, "create producer", |connection| {
+        let producer_name = producer_name.clone();
+        async move {
+            create_producer_once(&connection, topic, producer_id, producer_name, options).await
+        }
+    })
+    .await
+}
 
-    loop {
-        warn!(
-            "Retry #{current_retries} -> connecting producer {producer_id} using connection {:#} to broker {:#} to topic {topic}",
-            connection.id(),
-            addr.url,
-        );
-        match connection
+/// Sends one create-producer request on `connection`, waiting for exclusive
+/// access if the broker asks to, and returns the producer's name and schema
+/// version.
+pub async fn create_producer_once<Exe: Executor>(
+    connection: &Arc<Connection<Exe>>,
+    topic: &str,
+    producer_id: u64,
+    producer_name: Option<String>,
+    options: &ProducerOptions,
+) -> Result<(String, Option<Vec<u8>>), ConnectionError> {
+    let partial_success = connection
+        .sender()
+        .create_producer(
+            topic.to_owned(),
+            producer_id,
+            producer_name,
+            options.clone(),
+        )
+        .await?;
+    let mut schema_version = partial_success.schema_version;
+    // If producer is not "ready", the client will avoid to timeout the request
+    // for creating the producer. Instead it will wait indefinitely until it gets
+    // a subsequent  `CommandProducerSuccess` with `producer_ready==true`.
+    if partial_success.producer_ready == Some(false) {
+        // wait until next commandproducersuccess message has been received
+        trace!("TopicProducer::create({topic}) waiting for exclusive access");
+        let result = connection
             .sender()
-            .create_producer(
-                topic.clone(),
-                producer_id,
-                producer_name.clone(),
-                options.clone(),
-            )
-            .await
-        {
-            Ok(partial_success) => {
-                let mut schema_version = partial_success.schema_version;
-                // If producer is not "ready", the client will avoid to timeout the request
-                // for creating the producer. Instead it will wait indefinitely until it gets
-                // a subsequent  `CommandProducerSuccess` with `producer_ready==true`.
-                if let Some(producer_ready) = partial_success.producer_ready {
-                    if !producer_ready {
-                        // wait until next commandproducersuccess message has been received
-                        trace!("TopicProducer::create({topic}) waiting for exclusive access");
-                        let result = connection
-                            .sender()
-                            .wait_for_exclusive_access(partial_success.request_id)
-                            .await;
-                        trace!("TopicProducer::create({topic}) received: {result:?}");
-                        match result {
-                            Ok(success) => {
-                                if let Some(new_sv) = success.schema_version {
-                                    if schema_version.as_ref() != Some(&new_sv) {
-                                        debug!(
-                                            "TopicProducer::create({topic}) schema_version \
-                                             updated after exclusive access wait"
-                                        );
-                                        schema_version = Some(new_sv);
-                                    }
-                                } else if schema_version.is_some() {
-                                    warn!(
-                                        "TopicProducer::create({topic}) final \
-                                         CommandProducerSuccess has no schema_version, \
-                                         keeping initial value"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "TopicProducer::create({topic}) wait_for_exclusive_access \
-                                     failed: {e:?}, proceeding with initial schema_version"
-                                );
-                            }
-                        }
+            .wait_for_exclusive_access(partial_success.request_id)
+            .await;
+        trace!("TopicProducer::create({topic}) received: {result:?}");
+        match result {
+            Ok(success) => {
+                if let Some(new_sv) = success.schema_version {
+                    if schema_version.as_ref() != Some(&new_sv) {
+                        debug!(
+                            "TopicProducer::create({topic}) schema_version updated after \
+                             exclusive access wait"
+                        );
+                        schema_version = Some(new_sv);
                     }
-                }
-                if current_retries > 0 {
-                    let dur = (std::time::Instant::now() - start).as_secs();
-                    log::info!(
-                        "TopicProducer::create({topic}) success after {} retries over {dur} seconds",
-                        current_retries + 1,
+                } else if schema_version.is_some() {
+                    warn!(
+                        "TopicProducer::create({topic}) final CommandProducerSuccess has no \
+                         schema_version, keeping initial value"
                     );
                 }
-                return Ok((partial_success.producer_name, schema_version));
             }
-            Err(err) => {
-                handle_retry_error(
-                    client,
-                    connection,
-                    &mut addr,
-                    topic,
-                    "TopicProducer::create",
-                    current_retries,
-                    err,
-                )
-                .await?
+            Err(e) => {
+                error!(
+                    "TopicProducer::create({topic}) wait_for_exclusive_access failed: {e:?}, \
+                     proceeding with initial schema_version"
+                );
             }
         }
-        current_retries += 1;
     }
+    Ok((partial_success.producer_name, schema_version))
 }

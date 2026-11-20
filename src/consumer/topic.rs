@@ -80,11 +80,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             .unwrap_or(1000)
             .min(options.receiver_queue_size.unwrap_or(1000))
             .max(1);
-        let mut connection = client.manager.get_connection(&addr).await?;
-
-        let messages = retry_subscribe_consumer(
+        let (connection, messages) = retry_subscribe_consumer(
             &client,
-            &mut connection,
             addr,
             &topic,
             &subscription,
@@ -318,7 +315,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 Err(e) => Err(ConnectionError::Unexpected(e.to_string())),
             };
             match attempt {
-                Err(e) if may_succeed_later(&e) && std::time::Instant::now() < deadline => {
+                Err(e) if lost_or_not_ready(&e) && std::time::Instant::now() < deadline => {
                     let delay = crate::connection_manager::backoff(
                         Duration::from_millis(100),
                         Duration::from_secs(2),
@@ -524,8 +521,9 @@ impl<Exe: Executor> Drop for SeekGuard<Exe> {
     }
 }
 
-/// Failures of a request that a retry after a reconnect can fix.
-fn may_succeed_later(error: &ConnectionError) -> bool {
+/// Failures of a seek that a reconnect can fix: the connection was lost, or
+/// the broker was not ready. A refusal fails the seek at once.
+fn lost_or_not_ready(error: &ConnectionError) -> bool {
     match error {
         ConnectionError::Io(_) | ConnectionError::Disconnected | ConnectionError::SlowDown => true,
         ConnectionError::PulsarError(kind, _) => {

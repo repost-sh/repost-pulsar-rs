@@ -21,5 +21,6 @@ mod partitions;
 mod producer;
 mod reader;
 mod reconnect;
+mod retries;
 mod seek;
 mod smoke;

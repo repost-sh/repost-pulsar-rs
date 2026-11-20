@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{
     connection_manager::{BrokerAddress, ConnectionManager},
-    error::{ConnectionError, ServiceDiscoveryError},
+    error::ServiceDiscoveryError,
     executor::Executor,
     message::proto::{
         command_lookup_topic_response, command_partitioned_topic_metadata_response,
@@ -35,78 +35,71 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         &self,
         topic: S,
     ) -> Result<BrokerAddress, ServiceDiscoveryError> {
-        let retries = self.manager.connection_retry_options().max_retries;
-        self.lookup_topic_retrying(topic, retries).await
+        let topic = topic.into();
+        self.retrying("lookup", &topic, || self.lookup_topic_once(&topic))
+            .await
     }
 
-    /// Like [`Self::lookup_topic`], but every connection the lookup opens is
-    /// attempted at most `retries + 1` times.
-    pub(crate) async fn lookup_topic_retrying<S: Into<String>>(
+    /// Runs `attempt` until it succeeds, fails in a way no retry fixes, or the
+    /// operation timeout passes, backing off from `retry_delay` in between.
+    // Java: the lookups' backoff in BinaryProtoLookupService
+    async fn retrying<T, F, Fut>(
         &self,
-        topic: S,
-        retries: u32,
+        what: &str,
+        topic: &str,
+        mut attempt: F,
+    ) -> Result<T, ServiceDiscoveryError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ServiceDiscoveryError>>,
+    {
+        let options = &self.manager.operation_retry_options;
+        let max_backoff = self.manager.connection_retry_options().max_backoff;
+        let start = std::time::Instant::now();
+        let mut tries = 0;
+        loop {
+            let error = match attempt().await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            let delay = error
+                .may_retry(crate::error::Phase::Create)
+                .then(|| options.next_delay(start, tries, max_backoff))
+                .flatten();
+            let Some(delay) = delay else {
+                return Err(error);
+            };
+            warn!("{what}({topic}) failed, retrying in {delay:?}: {error}");
+            self.manager.executor.delay(delay).await;
+            tries += 1;
+        }
+    }
+
+    /// One pass of [`Self::lookup_topic`], following the broker's redirects,
+    /// with one attempt at each connection it opens: the caller retries.
+    pub(crate) async fn lookup_topic_once(
+        &self,
+        topic: &str,
     ) -> Result<BrokerAddress, ServiceDiscoveryError> {
-        let topic = topic.into();
         let mut proxied_query = false;
-        let mut conn = self.manager.get_base_connection().await?;
+        let mut conn = self
+            .manager
+            .get_connection_retrying(&self.manager.get_base_address(), 0)
+            .await?;
         let base_url = self.manager.url.clone();
         let mut is_authoritative = false;
-        let mut broker_address = self.manager.get_base_address();
-
-        let mut current_retries = 0u32;
-        let start = std::time::Instant::now();
-        let operation_retry_options = self.manager.operation_retry_options.clone();
 
         loop {
-            let response = match conn
+            let response = conn
                 .sender()
                 .lookup_topic(topic.to_string(), is_authoritative)
-                .await
-            {
-                Ok(res) => res,
-                Err(ConnectionError::Disconnected) => {
-                    error!("tried to lookup a topic but connection was closed, reconnecting...");
-                    conn = self
-                        .manager
-                        .get_connection_retrying(&broker_address, retries)
-                        .await?;
-                    conn.sender()
-                        .lookup_topic(topic.to_string(), is_authoritative)
-                        .await?
-                }
-                Err(e) => {
-                    error!("tried to lookup a topic but error occrured: {:?}", e);
-                    return Err(e.into());
-                }
-            };
+                .await?;
 
             if response.response.is_none()
                 || response.response
                     == Some(command_lookup_topic_response::LookupType::Failed as i32)
             {
                 let error = response.error.and_then(crate::error::server_error);
-                if matches!(
-                    error,
-                    Some(
-                        crate::message::proto::ServerError::ServiceNotReady
-                            | crate::message::proto::ServerError::MetadataError,
-                    )
-                ) {
-                    if operation_retry_options.max_retries.is_none()
-                        || operation_retry_options.max_retries.unwrap() > current_retries
-                    {
-                        error!("lookup({}) failed with {:?}, retrying request after {}ms (max_retries = {:?})", topic, error, operation_retry_options.retry_delay.as_millis(), operation_retry_options.max_retries);
-                        current_retries += 1;
-                        self.manager
-                            .executor
-                            .delay(operation_retry_options.retry_delay)
-                            .await;
-                        continue;
-                    } else {
-                        error!("lookup({}) reached max retries", topic);
-                    }
-                }
-
                 error!(
                     "tried to lookup a topic but error occured[{:?}]: {:?}",
                     line!(),
@@ -118,15 +111,6 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                 ));
             }
 
-            if current_retries > 0 {
-                let dur = (std::time::Instant::now() - start).as_secs();
-                log::info!(
-                    "lookup({}) success after {} retries over {} seconds",
-                    topic,
-                    current_retries + 1,
-                    dur
-                );
-            }
             let LookupResponse {
                 broker_url,
                 broker_url_tls,
@@ -166,7 +150,7 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                 connection_url.clone()
             };
 
-            broker_address = BrokerAddress {
+            let broker_address = BrokerAddress {
                 url,
                 broker_url,
                 proxy: proxied_query || proxy,
@@ -177,14 +161,14 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
             if redirect {
                 conn = self
                     .manager
-                    .get_connection_retrying(&broker_address, retries)
+                    .get_connection_retrying(&broker_address, 0)
                     .await?;
                 proxied_query = broker_address.proxy;
                 continue;
             } else {
                 let res = self
                     .manager
-                    .get_connection_retrying(&broker_address, retries)
+                    .get_connection_retrying(&broker_address, 0)
                     .await
                     .map(|_| broker_address)
                     .map_err(ServiceDiscoveryError::Connection);
@@ -200,7 +184,16 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         topic: S,
     ) -> Result<u32, ServiceDiscoveryError> {
         let topic = topic.into();
+        self.retrying("lookup_partitioned_topic_number", &topic, || {
+            self.lookup_partitioned_topic_number_once(&topic)
+        })
+        .await
+    }
 
+    async fn lookup_partitioned_topic_number_once(
+        &self,
+        topic: &str,
+    ) -> Result<u32, ServiceDiscoveryError> {
         // This is a fast path to reduce the number of lookup requests for topic partition metadata
         // and as a side effect reduce amplification on zookeeper.
         // For example, for a topic with 12 partitions, before this patch we did 13 lookup requests
@@ -215,66 +208,26 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
             return Ok(0);
         }
 
-        let mut connection = self.manager.get_base_connection().await?;
-        let mut current_retries = 0u32;
-        let start = std::time::Instant::now();
-        let operation_retry_options = self.manager.operation_retry_options.clone();
-
-        let response = loop {
-            let response = match connection.sender().lookup_partitioned_topic(&topic).await {
-                Ok(res) => res,
-                Err(ConnectionError::Disconnected) => {
-                    error!("tried to lookup a topic but connection was closed, reconnecting...");
-                    connection = self.manager.get_base_connection().await?;
-                    connection.sender().lookup_partitioned_topic(&topic).await?
-                }
-                Err(e) => return Err(e.into()),
-            };
+        let connection = self
+            .manager
+            .get_connection_retrying(&self.manager.get_base_address(), 0)
+            .await?;
+        let response = {
+            let response = connection.sender().lookup_partitioned_topic(topic).await?;
 
             if response.response.is_none()
                 || response.response
                     == Some(command_partitioned_topic_metadata_response::LookupType::Failed as i32)
             {
                 let error = response.error.and_then(crate::error::server_error);
-                if error == Some(crate::message::proto::ServerError::ServiceNotReady) {
-                    if operation_retry_options.max_retries.is_none()
-                        || operation_retry_options.max_retries.unwrap() > current_retries
-                    {
-                        error!("lookup_partitioned_topic_number({}) answered ServiceNotReady, retrying request after {}ms (max_retries = {:?})",
-                    topic, operation_retry_options.retry_delay.as_millis(),
-                    operation_retry_options.max_retries);
-
-                        current_retries += 1;
-                        self.manager
-                            .executor
-                            .delay(operation_retry_options.retry_delay)
-                            .await;
-                        continue;
-                    } else {
-                        error!(
-                            "lookup_partitioned_topic_number({}) reached max retries",
-                            topic
-                        );
-                    }
-                }
                 return Err(ServiceDiscoveryError::Query(
                     error,
                     response.message.clone(),
                 ));
             }
 
-            break response;
+            response
         };
-
-        if current_retries > 0 {
-            let dur = (std::time::Instant::now() - start).as_secs();
-            log::info!(
-                "lookup_partitioned_topic_number({}) success after {} retries over {} seconds",
-                topic,
-                current_retries + 1,
-                dur
-            );
-        }
 
         match response.partitions {
             Some(partitions) => Ok(partitions),
