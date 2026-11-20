@@ -8,6 +8,32 @@ use crate::{
     DeserializeMessage, Error, Payload,
 };
 
+/// Which consumer of a Failover subscription the broker sends a topic or
+/// partition to. For each partition, events alternate, starting with
+/// [`ConsumerEvent::BecameActive`].
+// Java: ConsumerEventListener becameActive / becameInactive
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerEvent {
+    /// This consumer receives `topic` from now on, a partition name such as
+    /// `persistent://public/default/orders-partition-3`. The broker restarts
+    /// it at the last acknowledged message, so this needs no seek: a seek
+    /// reconnects the consumer, which ends the activation and starts a new one.
+    BecameActive { topic: String },
+    /// This consumer may no longer be the one that receives `topic`: the
+    /// broker moved it to another consumer, or the consumer reconnected,
+    /// after a seek too. Messages of `topic` handed over before this event may
+    /// be redelivered elsewhere.
+    BecameInactive { topic: String },
+}
+
+/// What [`crate::Consumer::next_item`] hands over: a message, or a Failover
+/// event, in the order the broker sent them for each partition.
+#[derive(Debug)]
+pub enum ConsumerItem<T> {
+    Message(Message<T>),
+    Event(ConsumerEvent),
+}
+
 /// a message received by a consumer
 ///
 /// it is generic over the type it can be deserialized to

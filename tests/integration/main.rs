@@ -11,6 +11,8 @@ mod acks;
 mod batch_acks;
 mod cluster;
 mod delivery;
+mod events;
+mod reader;
 mod reconnect;
 mod seek;
 mod smoke;

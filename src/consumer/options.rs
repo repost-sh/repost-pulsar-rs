@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
     consumer::initial_position::InitialPosition,
@@ -35,6 +35,10 @@ pub struct ConsumerOptions {
     /// }
     /// ```
     pub initial_position: InitialPosition,
+    /// Starts a reader this far back in time, rounded up to whole seconds.
+    /// Readers only, and not together with `start_message_id`.
+    // Java: ReaderBuilder.startMessageFromRollbackDuration
+    pub start_rollback: Option<Duration>,
 }
 
 impl ConsumerOptions {
@@ -78,6 +82,14 @@ impl ConsumerOptions {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_initial_position(mut self, initial_position: InitialPosition) -> Self {
         self.initial_position = initial_position;
+        self
+    }
+
+    /// Starts a reader `rollback` back in time, rounded up to whole seconds:
+    /// at the first message published since then.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_start_rollback(mut self, rollback: Duration) -> Self {
+        self.start_rollback = Some(rollback);
         self
     }
 

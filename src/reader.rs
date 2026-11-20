@@ -1,167 +1,137 @@
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
 use chrono::{DateTime, Utc};
 use futures::{
-    channel::mpsc::SendError,
     task::{Context, Poll},
-    Future, SinkExt, Stream,
+    Stream,
 };
 use url::Url;
 
 use crate::{
     client::DeserializeMessage,
-    consumer::{ConsumerOptions, DeadLetterPolicy, EngineMessage, Message, TopicConsumer},
+    consumer::{Consumer, ConsumerOptions, DeadLetterPolicy, Message},
     error::Error,
     executor::Executor,
     message::proto::{command_subscribe::SubType, MessageIdData},
 };
 
-/// A client that acknowledges messages systematically
+/// Reads a topic, or every partition of a partitioned topic, from a start
+/// position, through a non-durable subscription. It acknowledges each message
+/// as the application takes it.
+///
+/// On a partitioned topic, a partition whose consumer fails for good is
+/// logged and dropped, and rebuilt at the next topic refresh (30 s by
+/// default) from the configured start.
 pub struct Reader<T: DeserializeMessage, Exe: Executor> {
-    pub(crate) consumer: TopicConsumer<T, Exe>,
-    pub(crate) state: Option<State<T>>,
+    pub(crate) consumer: Consumer<T, Exe>,
+    /// The topic the reader was built for, partitioned or not.
+    pub(crate) topic: String,
 }
 
 impl<T: DeserializeMessage + 'static, Exe: Executor> Unpin for Reader<T, Exe> {}
-
-pub enum State<T: DeserializeMessage> {
-    PollingConsumer,
-    PollingAck(
-        Message<T>,
-        Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + Sync>>,
-    ),
-}
 
 impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Reader<T, Exe> {
     type Item = Result<Message<T>, Error>;
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.state.take().unwrap() {
-            State::PollingConsumer => match Pin::new(&mut this.consumer).poll_next(cx) {
-                Poll::Pending => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Pending
-                }
-
-                Poll::Ready(None) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(None)
-                }
-
-                Poll::Ready(Some(Ok(msg))) => {
-                    let mut acker = this.consumer.acker();
-                    let message_id = msg.ack_id();
-                    this.state = Some(State::PollingAck(
-                        msg,
-                        Box::pin(
-                            async move { acker.send(EngineMessage::Ack(message_id, false)).await },
-                        ),
-                    ));
-                    Pin::new(this).poll_next(cx)
-                }
-
-                Poll::Ready(Some(Err(e))) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(Some(Err(e)))
-                }
-            },
-            State::PollingAck(msg, mut ack_fut) => match ack_fut.as_mut().poll(cx) {
-                Poll::Pending => {
-                    this.state = Some(State::PollingAck(msg, ack_fut));
-                    Poll::Pending
-                }
-
-                Poll::Ready(res) => {
-                    this.state = Some(State::PollingConsumer);
-                    Poll::Ready(Some(
-                        res.map_err(|err| Error::Consumer(err.into())).map(|()| msg),
-                    ))
-                }
-            },
-        }
+        Pin::new(&mut self.get_mut().consumer).poll_next(cx)
     }
 }
 
 impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
-    // this is totally useless as calling ConsumerBuilder::new(&pulsar_client)
-    // does just the same
-    /*
-    /// creates a [ReaderBuilder] from a client instance
-    pub fn builder(pulsar: &Pulsar<Exe>) -> ConsumerBuilder<Exe> {
-        ConsumerBuilder::new(pulsar)
-    }
-    */
-
     /// test that the connections to the Pulsar brokers are still valid
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn check_connection(&mut self) -> Result<(), Error> {
         self.consumer.check_connection().await
     }
 
-    /// returns topic this reader is subscribed on
+    /// returns the topic this reader was built for
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn topic(&self) -> String {
-        self.consumer.topic()
+        self.topic.clone()
     }
 
-    /// returns a list of broker URLs this reader is connected to
+    /// returns the broker URLs this reader is connected to, one per broker
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn connections(&mut self) -> Result<Url, Error> {
-        Ok(self.consumer.connection().await?.url().clone())
+    pub async fn connections(&mut self) -> Result<Vec<Url>, Error> {
+        self.consumer.connections().await
     }
 
     /// returns the consumer's configuration options
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn options(&self) -> &ConsumerOptions {
-        &self.consumer.config.options
+        self.consumer.options()
     }
 
-    // is this necessary?
     /// returns the consumer's dead letter policy options
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn dead_letter_policy(&self) -> Option<&DeadLetterPolicy> {
-        self.consumer.dead_letter_policy.as_ref()
+        self.consumer.dead_letter_policy()
     }
 
     /// returns the readers's subscription name
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn subscription(&self) -> &str {
-        &self.consumer.config.subscription
+        self.consumer.subscription()
     }
 
     /// returns the reader's subscription type
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn sub_type(&self) -> SubType {
-        self.consumer.config.sub_type
+        self.consumer.sub_type()
     }
 
     /// returns the reader's batch size
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn batch_size(&self) -> Option<u32> {
-        self.consumer.config.batch_size
+        self.consumer.batch_size()
     }
 
     /// returns the reader's name
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn reader_name(&self) -> Option<&str> {
-        self.consumer.config.consumer_name.as_deref()
+        self.consumer.consumer_name()
     }
 
-    /// returns the reader's id
+    /// returns the reader's consumer ids, one per partition
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn reader_id(&self) -> u64 {
-        self.consumer.consumer_id
+    pub fn reader_id(&self) -> Vec<u64> {
+        self.consumer.consumer_id()
     }
 
+    /// Restarts after `message_id`, or at the first message published at or
+    /// after `timestamp`. A reader over a partitioned topic takes only a
+    /// timestamp here; [`Reader::seek_to`] moves one partition to an id.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn seek(
         &mut self,
         message_id: Option<MessageIdData>,
         timestamp: Option<u64>,
     ) -> Result<(), Error> {
-        self.consumer.seek(message_id, timestamp).await
+        if let Some(consumer) = self.consumer.single_mut() {
+            return consumer.seek(message_id, timestamp).await;
+        }
+        match (message_id, timestamp) {
+            (None, Some(timestamp)) => self.consumer.seek_to_time(timestamp).await,
+            _ => Err(Error::Custom(
+                "a reader over a partitioned topic seeks an id with seek_to".to_string(),
+            )),
+        }
+    }
+
+    /// Restarts one topic or partition after `message_id`, as
+    /// [`Consumer::seek_to`] does.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn seek_to(&mut self, topic: &str, message_id: MessageIdData) -> Result<(), Error> {
+        self.consumer.seek_to(topic, message_id).await
+    }
+
+    /// Restarts every partition at the first message published at or after
+    /// `publish_time_ms`, as [`Consumer::seek_to_time`] does.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn seek_to_time(&mut self, publish_time_ms: u64) -> Result<(), Error> {
+        self.consumer.seek_to_time(publish_time_ms).await
     }
 
     /// returns the date of the last message reception
@@ -170,9 +140,25 @@ impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
         self.consumer.last_message_received()
     }
 
+    /// The id of the last message published on the topic. A reader over a
+    /// partitioned topic has one per partition: [`Reader::last_message_ids`].
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn get_last_message_id(&mut self) -> Result<MessageIdData, Error> {
-        self.consumer.get_last_message_id().await
+        match self.consumer.single_mut() {
+            Some(consumer) => consumer.get_last_message_id().await,
+            None => Err(Error::Custom(
+                "a reader over a partitioned topic has one last id per partition: \
+                 last_message_ids"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The id of the last message published on each partition, as
+    /// [`Consumer::last_message_ids`] does.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn last_message_ids(&mut self) -> Result<BTreeMap<String, MessageIdData>, Error> {
+        self.consumer.last_message_ids().await
     }
 
     /// returns the current number of messages received
@@ -244,8 +230,9 @@ mod tests {
         assert!(reader.check_connection().await.is_ok());
         assert_eq!(reader.topic(), topic);
 
-        let url = reader.connections().await.unwrap();
-        assert_eq!(url.as_str(), addr);
+        let urls = reader.connections().await.unwrap();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].as_str(), addr);
 
         let option = reader.options();
         assert_eq!(option.initial_position, InitialPosition::Latest);
@@ -258,7 +245,7 @@ mod tests {
         assert_eq!(reader.batch_size(), None);
         assert_eq!(reader.reader_name().unwrap(), "test_reader");
         let reader_id = reader.reader_id();
-        assert!(reader_id > 0);
+        assert!(reader_id.iter().all(|id| *id > 0));
 
         let message = TestData {
             data: "test_reader_data".to_string(),

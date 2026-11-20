@@ -28,4 +28,6 @@ pub struct ConsumerConfig {
     pub(crate) options: ConsumerOptions,
     /// dead letter policy
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
+    /// Acknowledge each message as the application takes it, as a reader does.
+    pub(crate) auto_ack: bool,
 }

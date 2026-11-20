@@ -153,3 +153,29 @@ async fn seeking_a_topic_the_consumer_does_not_read_fails() {
         .await;
     assert!(result.is_err(), "seek on an unknown partition: {result:?}");
 }
+
+#[tokio::test]
+async fn a_time_seek_after_an_id_seek_restarts_at_the_time() {
+    let cluster = exclusive().await;
+    let topic = topic("seek-id-then-time");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let before = chrono::Utc::now().timestamp_millis() as u64;
+    publish(&pulsar, &topic, 1..=10).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    let taken = take(&mut consumer, &mut Delivered::default(), 10).await;
+
+    // Seeking to the last message leaves nothing to deliver after it.
+    consumer
+        .seek_to(&topic, taken[9].message_id().clone())
+        .await
+        .expect("seek to the last");
+    consumer
+        .seek_to_time(before)
+        .await
+        .expect("seek to the time");
+
+    let mut after = Delivered::default();
+    collect(&mut consumer, &mut after, 10, DEADLINE).await;
+    after.assert_exactly(&topic, 1..=10);
+}

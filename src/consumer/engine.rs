@@ -13,7 +13,7 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{DeadLetterPolicy, Delivery, EngineEvent, EngineMessage},
+        data::{DeadLetterPolicy, Delivery, EngineEvent, EngineMessage, Queued, Resume, Seek},
         options::ConsumerOptions,
     },
     error::{self, ConsumerError},
@@ -41,7 +41,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     name: Option<String>,
     /// Unbounded: the permits bound what the broker sends, and the consumer
     /// grants them as the application takes messages.
-    tx: mpsc::UnboundedSender<Result<(u64, MessageIdData, Payload), Error>>,
+    tx: mpsc::UnboundedSender<Result<Queued, Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     delivery: Arc<Mutex<Delivery>>,
     /// The epoch of the current connection, as last written to `delivery`.
@@ -49,10 +49,8 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Messages at or before this id are dropped, as the broker sends the entry
     /// a subscription restarts from again.
     start: Option<MessageIdData>,
-    /// Where a non-durable subscription starts when nothing was delivered.
-    configured_start: Option<MessageIdData>,
-    /// Whether `Delivery::first_queued` no longer needs updating, which spares
-    /// a lock per message.
+    /// Whether `Delivery::resume` is past waiting for the first queued message
+    /// on this connection, which spares a lock per message.
     first_queued_known: bool,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
@@ -81,7 +79,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         sub_type: SubType,
         id: u64,
         name: Option<String>,
-        tx: mpsc::UnboundedSender<Result<(u64, MessageIdData, Payload), Error>>,
+        tx: mpsc::UnboundedSender<Result<Queued, Error>>,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
         delivery: Arc<Mutex<Delivery>>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
@@ -104,7 +102,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             delivery,
             epoch: 0,
             start: None,
-            configured_start: options.start_message_id.clone(),
             first_queued_known: false,
             engine_rx: Some(engine_rx),
             event_rx,
@@ -410,12 +407,12 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     },
                 ..
             } => {
-                // TODO: Communicate this status to the Consumer and expose it
                 debug!(
                     "Active consumer change for {} - Active: {:?}",
                     self.debug_format(),
                     active_consumer_change.is_active
                 );
+                self.announce(active_consumer_change.is_active.unwrap_or(false))?;
             }
             RawMessage {
                 command:
@@ -676,12 +673,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     ) -> Result<(), Error> {
         if !self.first_queued_known {
             let mut delivery = self.delivery.lock().unwrap();
-            if delivery.last.is_none() && delivery.first_queued.is_none() {
-                delivery.first_queued = Some(message_id.clone());
+            // A message from before a seek is stale, and resumes nothing.
+            if delivery.epoch == self.epoch {
+                if matches!(delivery.resume, Resume::Configured | Resume::Time(_)) {
+                    delivery.resume = Resume::From(message_id.clone());
+                }
+                self.first_queued_known = true;
             }
-            self.first_queued_known = true;
         }
-        self.deliver(Ok((self.epoch, message_id, payload)))
+        self.deliver(Ok(Queued::Message(self.epoch, message_id, payload)))
     }
 
     /// Subscribes again after the connection broke or the broker closed the
@@ -698,7 +698,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
-        {
+        let options = {
             let mut delivery = self.delivery.lock().unwrap();
             delivery.epoch += 1;
             self.epoch = delivery.epoch;
@@ -706,27 +706,43 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             if let Some(taken) = &mut delivery.taken {
                 taken.clear();
             }
-            let non_durable = self.options.durable == Some(false);
-            if let Some(target) = delivery.seek_target.take() {
-                // Java: ConsumerImpl.java:3070, after a seek the target becomes
-                // the exclusive start.
-                if non_durable {
-                    self.options.start_message_id = Some(target.clone());
-                }
-                self.start = Some(target);
-            } else if non_durable {
-                let (start_message_id, start) = match (&delivery.last, &delivery.first_queued) {
-                    (Some(last), _) => (Some(last.clone()), Some(last.clone())),
-                    (None, Some(first)) => (Some(first.clone()), before_in_entry(first)),
-                    (None, None) => (self.configured_start.clone(), None),
+            // Java: ConsumerImpl.java:3070, after a seek the target becomes
+            // the exclusive start; after a seek by time nothing is filtered.
+            let seek = delivery.pending_seek.take();
+            match &seek {
+                Some(Seek::Id(target)) => self.start = Some(target.clone()),
+                Some(Seek::Time(_)) => self.start = None,
+                None => {}
+            }
+            let mut options = self.options.clone();
+            if self.options.durable == Some(false) {
+                // The broker applies a rollback on every subscribe, so the
+                // configured one goes only until delivery moved.
+                let (start_message_id, start, rollback) = match &delivery.resume {
+                    Resume::Configured => (
+                        self.options.start_message_id.clone(),
+                        None,
+                        self.options.start_rollback,
+                    ),
+                    // The broker keeps the subscription across its own seek;
+                    // a later reconnect may find it gone.
+                    Resume::Time(publish_time_ms) => {
+                        (None, None, seek.is_none().then(|| since(*publish_time_ms)))
+                    }
+                    Resume::From(first) => (Some(first.clone()), before_in_entry(first), None),
+                    Resume::After(last) => (Some(last.clone()), Some(last.clone()), None),
                 };
-                self.options.start_message_id = start_message_id;
+                options.start_message_id = start_message_id;
+                options.start_rollback = rollback;
                 self.start = start;
             }
-            if delivery.first_queued.is_none() {
-                self.first_queued_known = false;
-            }
-        }
+            self.first_queued_known = matches!(delivery.resume, Resume::From(_) | Resume::After(_));
+            options
+        };
+        // Another consumer may receive the partition until this one is back,
+        // even after a seek, since the broker reconnects every consumer of the
+        // partition; the broker says so again if it is still ours.
+        let _ = self.announce(false);
         self.unacked_messages.clear();
         // Java ties batch ack state to the delivered ids, which a reconnect
         // delivers anew.
@@ -748,7 +764,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             if self.tx.is_closed() {
                 return Err(Error::Consumer(ConsumerError::Closed));
             }
-            match self.resubscribe().await {
+            match self.resubscribe(&options).await {
                 Ok(messages) => {
                     // Acks sent while disconnected go out before the permits,
                     // so the broker does not dispatch those messages again.
@@ -809,7 +825,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     }
 
     /// One attempt: look the topic up, connect to its broker, subscribe.
-    async fn resubscribe(&mut self) -> Result<mpsc::UnboundedReceiver<RawMessage>, Error> {
+    async fn resubscribe(
+        &mut self,
+        options: &ConsumerOptions,
+    ) -> Result<mpsc::UnboundedReceiver<RawMessage>, Error> {
         let broker_address = self.client.lookup_topic_once(&self.topic).await?;
         // One attempt: if the broker does not answer, the next attempt looks
         // the topic up again, which finds it once ownership has moved.
@@ -825,7 +844,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             self.sub_type,
             self.id,
             &self.name,
-            &self.options,
+            options,
         )
         .await?;
         Ok(messages)
@@ -951,8 +970,19 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
-    fn deliver(&mut self, item: Result<(u64, MessageIdData, Payload), Error>) -> Result<(), Error> {
-        if item.is_ok() {
+    /// Tells the application that this Failover consumer receives the
+    /// partition from now on, or may not any more. The consumer drops what
+    /// repeats the last thing the application heard.
+    // Java: ConsumerImpl.java activeConsumerChanged
+    fn announce(&mut self, active: bool) -> Result<(), Error> {
+        if self.sub_type != SubType::Failover {
+            return Ok(());
+        }
+        self.deliver(Ok(Queued::Active(active)))
+    }
+
+    fn deliver(&mut self, item: Result<Queued, Error>) -> Result<(), Error> {
+        if let Ok(Queued::Message(..)) = item {
             self.frame_accounted += 1;
             self.delivery.lock().unwrap().queued += 1;
         }
@@ -1057,6 +1087,16 @@ fn whole_entry(id: MessageIdData) -> MessageIdData {
         ack_set: Vec::new(),
         ..id
     }
+}
+
+/// How long ago `publish_time_ms` was, and at least a millisecond, so a
+/// rollback to it is never empty.
+fn since(publish_time_ms: u64) -> Duration {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    now.saturating_sub(Duration::from_millis(publish_time_ms))
+        .max(Duration::from_millis(1))
 }
 
 /// Where `id` sits in delivery order.

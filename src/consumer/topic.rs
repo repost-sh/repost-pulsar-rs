@@ -19,9 +19,13 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, Delivery, EngineMessage, MessageData, MessageIdDataReceiver},
+        data::{
+            DeadLetterPolicy, Delivery, EngineMessage, MessageData, MessageIdDataReceiver, Queued,
+            Resume, Seek,
+        },
         engine::ConsumerEngine,
         message::Message,
+        message::{ConsumerEvent, ConsumerItem},
     },
     error::{ConnectionError, ConsumerError},
     message::proto::{MessageIdData, Schema},
@@ -30,7 +34,6 @@ use crate::{
     BrokerAddress, DeserializeMessage, Error, Executor, Payload, Pulsar,
 };
 
-// this is entirely public for use in reader.rs
 pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) consumer_id: u64,
     pub(crate) config: ConsumerConfig,
@@ -44,6 +47,8 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
     pub(super) last_message_received: Option<DateTime<Utc>>,
     pub(super) messages_received: u64,
+    /// Whether the last Failover event the application took said active.
+    pub(super) active: bool,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
@@ -65,6 +70,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             unacked_message_redelivery_delay,
             options,
             dead_letter_policy,
+            auto_ack: _,
         } = config.clone();
         let consumer_id =
             consumer_id.unwrap_or_else(|| CONSUMER_ID_GENERATOR.fetch_add(1, Ordering::SeqCst));
@@ -158,6 +164,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
             last_message_received: None,
             messages_received: 0,
+            active: false,
         })
     }
 
@@ -213,11 +220,6 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub(crate) fn acker(&self) -> mpsc::UnboundedSender<EngineMessage<Exe>> {
-        self.engine_tx.clone()
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         self.engine_tx
             .send(EngineMessage::Ack(msg.ack_id(), true))
@@ -264,16 +266,34 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         // Raising the epoch keeps what is buffered from before the seek from
         // reaching the application, as Java clears the queue first.
         // Java: MultiTopicsConsumerImpl.java:944 beforeSeek
-        let (epoch, before) = {
+        let seek = match (&message_id, timestamp) {
+            (Some(target), _) => Seek::Id(target.clone()),
+            (None, Some(publish_time_ms)) => Seek::Time(publish_time_ms),
+            (None, None) => {
+                return Err(Error::Custom(
+                    "a seek needs a message id or a publish time".to_string(),
+                ))
+            }
+        };
+        let mut guard = {
             let mut delivery = self.delivery.lock().unwrap();
+            let resume = match &seek {
+                Seek::Id(target) => Resume::After(target.clone()),
+                Seek::Time(publish_time_ms) => Resume::Time(*publish_time_ms),
+            };
             let before = (
-                delivery.last.take(),
-                delivery.first_queued.take(),
-                delivery.seek_target.clone(),
+                std::mem::replace(&mut delivery.resume, resume),
+                delivery.pending_seek.replace(seek.clone()),
             );
-            delivery.seek_target = message_id.clone();
             delivery.epoch += 1;
-            (delivery.epoch, before)
+            SeekGuard {
+                delivery: self.delivery.clone(),
+                engine_tx: self.engine_tx.clone(),
+                epoch: delivery.epoch,
+                target: message_id.clone(),
+                before: Some(before),
+                sent: false,
+            }
         };
         // Java: ConsumerImpl.java:3043 seekAsyncInternal retries until the
         // operation timeout, so a seek survives a broker failover. A seek
@@ -283,13 +303,18 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         let result = loop {
             // A reconnect may have taken the target meanwhile; the next
             // reconnect, after this attempt, needs it again.
-            self.delivery.lock().unwrap().seek_target = message_id.clone();
+            self.delivery.lock().unwrap().pending_seek = Some(seek.clone());
             let attempt = match self.connection().await {
-                Ok(connection) => connection
-                    .sender()
-                    .seek(consumer_id, message_id.clone(), timestamp)
-                    .await
-                    .map(drop),
+                Ok(connection) => {
+                    // cancelled from here on, the seek may have reached the
+                    // broker, so it stays
+                    guard.sent = true;
+                    connection
+                        .sender()
+                        .seek(consumer_id, message_id.clone(), timestamp)
+                        .await
+                        .map(drop)
+                }
                 Err(e) => Err(ConnectionError::Unexpected(e.to_string())),
             };
             match attempt {
@@ -300,21 +325,11 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 result => break result,
             }
         };
-        if result.is_err() {
-            let mut delivery = self.delivery.lock().unwrap();
-            if delivery.epoch == epoch {
-                delivery.epoch -= 1;
-                (delivery.last, delivery.first_queued, delivery.seek_target) = before;
-            } else {
-                // a reconnect applied the target, but the broker never moved
-                delivery.seek_target = None;
-                if let Some(target) = message_id {
-                    let _ = self
-                        .engine_tx
-                        .unbounded_send(EngineMessage::CancelSeek(target));
-                }
-            }
+        match &result {
+            Ok(()) => guard.before = None,
+            Err(_) => guard.sent = false,
         }
+        drop(guard);
         result?;
         Ok(())
     }
@@ -384,16 +399,32 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 }
 
-impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
-    type Item = Result<Message<T>, Error>;
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
+    /// The next message or Failover event.
+    pub(super) fn poll_next_item(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ConsumerItem<T>, Error>>> {
         loop {
             match self.messages.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Ok((epoch, id, payload)))) => {
+                Poll::Ready(Some(Ok(Queued::Active(active)))) => {
+                    // The broker repeats itself, and says "not active" to
+                    // consumers that never were.
+                    if active == self.active {
+                        continue;
+                    }
+                    self.active = active;
+                    let topic = self.topic.clone();
+                    let event = if active {
+                        ConsumerEvent::BecameActive { topic }
+                    } else {
+                        ConsumerEvent::BecameInactive { topic }
+                    };
+                    return Poll::Ready(Some(Ok(ConsumerItem::Event(event))));
+                }
+                Poll::Ready(Some(Ok(Queued::Message(epoch, id, payload)))) => {
                     // C++: lib/ConsumerImpl.cc:1162 receiveHelper drops messages
                     // that arrived on an earlier connection.
                     let flow = {
@@ -409,7 +440,7 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
                             }
                             continue;
                         }
-                        delivery.last = Some(id.clone());
+                        delivery.resume = Resume::After(id.clone());
                         if let Some(taken) = &mut delivery.taken {
                             taken.push((id.clone(), std::time::Instant::now()));
                         }
@@ -423,12 +454,63 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
                     }
                     self.last_message_received = Some(Utc::now());
                     self.messages_received += 1;
-                    return Poll::Ready(Some(Ok(self.create_message(id, payload))));
+                    let message = self.create_message(id, payload);
+                    if self.config.auto_ack {
+                        // If the engine is gone, nothing can be acked; what is
+                        // still queued drains, and then the stream ends.
+                        let _ = self
+                            .engine_tx
+                            .unbounded_send(EngineMessage::Ack(message.ack_id(), false));
+                    }
+                    return Poll::Ready(Some(Ok(ConsumerItem::Message(message))));
                 }
                 Poll::Ready(Some(Err(e))) => {
                     error!("we are using in the single-consumer and we got an error, {e}");
                     return Poll::Ready(Some(Err(e)));
                 }
+            }
+        }
+    }
+}
+
+/// Puts the delivery state back when a seek fails, or is dropped before its
+/// request went out.
+struct SeekGuard<Exe: Executor> {
+    delivery: Arc<Mutex<Delivery>>,
+    engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
+    /// The epoch the seek raised.
+    epoch: u64,
+    target: Option<MessageIdData>,
+    /// The resume point and pending seek the seek replaced; `None` once the
+    /// broker confirmed it.
+    before: Option<(Resume, Option<Seek>)>,
+    /// The request may have reached the broker, which then moves whatever the
+    /// application does; a failure answered by the broker clears it again.
+    sent: bool,
+}
+
+impl<Exe: Executor> Drop for SeekGuard<Exe> {
+    fn drop(&mut self) {
+        let Some((resume, pending_seek)) = self.before.take() else {
+            return;
+        };
+        if self.sent {
+            return;
+        }
+        let Ok(mut delivery) = self.delivery.lock() else {
+            return;
+        };
+        if delivery.epoch == self.epoch {
+            delivery.epoch -= 1;
+            delivery.resume = resume;
+            delivery.pending_seek = pending_seek;
+        } else {
+            // a reconnect applied the target, but the broker never moved
+            delivery.pending_seek = None;
+            if let Some(target) = self.target.take() {
+                let _ = self
+                    .engine_tx
+                    .unbounded_send(EngineMessage::CancelSeek(target));
             }
         }
     }

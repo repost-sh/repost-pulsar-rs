@@ -8,10 +8,16 @@ use crate::{
     Error, Executor, Payload,
 };
 
-/// Messages on their way from the engine to the application, each tagged with
-/// the epoch of the connection it arrived on.
-pub type MessageIdDataReceiver =
-    mpsc::UnboundedReceiver<Result<(u64, MessageIdData, Payload), Error>>;
+/// What an engine hands its consumer, in the order the broker sent it.
+pub enum Queued {
+    /// A message, tagged with the epoch of the connection it arrived on.
+    Message(u64, MessageIdData, Payload),
+    /// What the broker says, or a reconnect implies, about whether this
+    /// Failover consumer receives the partition. No reconnect makes it stale.
+    Active(bool),
+}
+
+pub type MessageIdDataReceiver = mpsc::UnboundedReceiver<Result<Queued, Error>>;
 
 pub enum EngineEvent<Exe: Executor> {
     /// A frame from the broker, tagged with the epoch of its connection.
@@ -20,6 +26,35 @@ pub enum EngineEvent<Exe: Executor> {
     /// Once a second, so a connection that broke without closing is noticed
     /// even when nothing else happens.
     Tick,
+}
+
+/// Where a non-durable subscription starts again after a reconnect.
+// Java: ConsumerImpl.java:1273-1304 startMessageId
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum Resume {
+    /// Nothing moved delivery yet: the configured start, with its rollback,
+    /// which the broker would apply again on every subscribe after that.
+    // Java: ConsumerImpl.java:1066 startMessageId equals the initial one
+    #[default]
+    Configured,
+    /// After a seek to this publish time, in milliseconds. A later reconnect
+    /// rolls the subscription back to it, since the broker would otherwise
+    /// start a new subscription at the configured start. Java starts from the
+    /// earliest message instead (ConsumerImpl.java:3125), replaying the topic.
+    Time(u64),
+    /// The first message queued while the application had taken none.
+    From(MessageIdData),
+    /// After the last message the application took, or a seek's target.
+    After(MessageIdData),
+}
+
+/// Where a seek moves a consumer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Seek {
+    /// After this message.
+    Id(MessageIdData),
+    /// To the first message published at or after this time, in milliseconds.
+    Time(u64),
 }
 
 /// What the application has taken from one topic consumer, shared between the
@@ -33,15 +68,11 @@ pub(crate) struct Delivery {
     /// dropped instead of delivered: the broker sends it again on the new
     /// connection if it still owes it.
     pub epoch: u64,
-    /// The last message handed to the application, where a non-durable
-    /// subscription resumes after a reconnect.
-    pub last: Option<MessageIdData>,
-    /// The first message queued for the application while it had taken none
-    /// yet, where a non-durable subscription resumes if `last` is unset.
-    pub first_queued: Option<MessageIdData>,
-    /// The target of a seek the next reconnect has not applied yet. The broker
-    /// closes the consumer when it seeks, and delivery restarts after it.
-    pub seek_target: Option<MessageIdData>,
+    /// Where a non-durable subscription starts again after a reconnect.
+    pub resume: Resume,
+    /// A seek the next reconnect has not applied yet. The broker closes the
+    /// consumer when it seeks, and delivery restarts there.
+    pub pending_seek: Option<Seek>,
     /// Permits freed on this epoch's connection and not yet given back, by
     /// messages the application took or the engine dropped.
     pub freed: u32,

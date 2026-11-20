@@ -1800,6 +1800,13 @@ pub(crate) mod messages {
                     initial_position: Some(options.initial_position.into()),
                     schema: options.schema,
                     start_message_id: options.start_message_id,
+                    // the protocol counts whole seconds; round up, so a
+                    // rollback never comes out shorter than asked
+                    start_message_rollback_duration_sec: options.start_rollback.map(|rollback| {
+                        let seconds = rollback.as_nanos().div_ceil(1_000_000_000);
+                        // the broker reads a signed long
+                        u64::try_from(seconds).map_or(i64::MAX as u64, |s| s.min(i64::MAX as u64))
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()

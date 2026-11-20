@@ -26,7 +26,7 @@ use futures::{
     Stream,
 };
 pub use initial_position::InitialPosition;
-pub use message::Message;
+pub use message::{ConsumerEvent, ConsumerItem, Message};
 use multi::MultiTopicConsumer;
 pub use options::ConsumerOptions;
 pub use topic::TopicConsumer;
@@ -209,13 +209,16 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     // Java: MultiTopicsConsumerImpl.java:926 seekAsync(long)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn seek_to_time(&mut self, publish_time_ms: u64) -> Result<(), Error> {
-        try_join_all(
+        // Every seek runs to its end: one that failed must not cancel the
+        // others halfway, leaving their partitions moved or not.
+        futures::future::join_all(
             self.topic_consumers()
                 .into_iter()
                 .map(|c| c.seek(None, Some(publish_time_ms))),
         )
-        .await?;
-        Ok(())
+        .await
+        .into_iter()
+        .collect()
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -245,6 +248,32 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
             }))
             .await?;
         Ok(ids.into_iter().collect())
+    }
+
+    /// The next message or Failover event. Events come only on Failover
+    /// subscriptions, each before the messages it concerns; the plain
+    /// [`Stream`] skips them.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn next_item(&mut self) -> Option<Result<ConsumerItem<T>, Error>> {
+        futures::future::poll_fn(|cx| self.poll_next_item(cx)).await
+    }
+
+    fn poll_next_item(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ConsumerItem<T>, Error>>> {
+        match &mut self.inner {
+            InnerConsumer::Single(c) => c.poll_next_item(cx),
+            InnerConsumer::Multi(c) => c.poll_next_item(cx),
+        }
+    }
+
+    /// The topic consumer, unless this consumer reads several.
+    pub(crate) fn single_mut(&mut self) -> Option<&mut TopicConsumer<T, Exe>> {
+        match &mut self.inner {
+            InnerConsumer::Single(c) => Some(c),
+            InnerConsumer::Multi(_) => None,
+        }
     }
 
     /// The consumer of each topic or partition this consumer reads.
@@ -401,10 +430,15 @@ impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Consumer<T, Exe>
     type Item = Result<Message<T>, Error>;
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match &mut self.inner {
-            InnerConsumer::Single(c) => Pin::new(c).poll_next(cx),
-            InnerConsumer::Multi(c) => Pin::new(c).poll_next(cx),
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match futures::ready!(this.poll_next_item(cx)) {
+                Some(Ok(ConsumerItem::Event(_))) => {}
+                Some(Ok(ConsumerItem::Message(message))) => return Poll::Ready(Some(Ok(message))),
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => return Poll::Ready(None),
+            }
         }
     }
 }

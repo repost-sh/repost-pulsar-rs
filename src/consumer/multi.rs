@@ -12,7 +12,11 @@ use futures::{future::try_join_all, Stream};
 use regex::Regex;
 
 use crate::{
-    consumer::{config::ConsumerConfig, message::Message, topic::TopicConsumer},
+    consumer::{
+        config::ConsumerConfig,
+        message::{ConsumerEvent, ConsumerItem, Message},
+        topic::TopicConsumer,
+    },
     error::{ConnectionError, ConsumerError},
     message::proto::{MessageIdData, Schema},
     proto,
@@ -38,6 +42,9 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     // Stats on disconnected consumers to keep metrics correct
     pub(super) disc_messages_received: u64,
     pub(super) disc_last_message_received: Option<DateTime<Utc>>,
+    /// Events for partitions dropped after an error: the application saw
+    /// them active, and nothing will say otherwise now.
+    pub(super) pending_events: VecDeque<ConsumerEvent>,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
@@ -119,6 +126,12 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         self.existing_topics.retain(|t| !topics.contains(t));
         for topic in topics {
             if let Some(consumer) = self.consumers.remove(topic) {
+                if consumer.active {
+                    self.pending_events
+                        .push_back(ConsumerEvent::BecameInactive {
+                            topic: topic.clone(),
+                        });
+                }
                 self.disc_messages_received += consumer.messages_received;
                 self.disc_last_message_received = self
                     .disc_last_message_received
@@ -287,11 +300,15 @@ impl<T: DeserializeMessage, Exe: Executor> Debug for MultiTopicConsumer<T, Exe> 
     }
 }
 
-impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsumer<T, Exe> {
-    type Item = Result<Message<T>, Error>;
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
+    /// The next message or Failover event of any topic or partition.
+    pub(super) fn poll_next_item(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<ConsumerItem<T>, Error>>> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Poll::Ready(Some(Ok(ConsumerItem::Event(event))));
+        }
         if let Some(mut new_consumers) = self.new_consumers.take() {
             match new_consumers.as_mut().poll(cx) {
                 Poll::Ready(Ok(new_consumers)) => {
@@ -310,7 +327,7 @@ impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsum
 
         if let Poll::Ready(Some(_)) = self.refresh.as_mut().poll_next(cx) {
             self.update_topics();
-            return self.poll_next(cx);
+            return self.poll_next_item(cx);
         }
 
         let mut topics_to_remove = Vec::new();
@@ -323,11 +340,11 @@ impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsum
             if let Some(item) = self
                 .consumers
                 .get_mut(&topic)
-                .map(|c| c.as_mut().poll_next(cx))
+                .map(|c| c.as_mut().get_mut().poll_next_item(cx))
             {
                 match item {
                     Poll::Pending => {}
-                    Poll::Ready(Some(Ok(msg))) => result = Some(msg),
+                    Poll::Ready(Some(Ok(item))) => result = Some(item),
                     Poll::Ready(None) => {
                         error!("Unexpected end of stream for pulsar topic {}", topic);
                         topics_to_remove.push(topic.clone());
@@ -348,6 +365,9 @@ impl<T: 'static + DeserializeMessage, Exe: Executor> Stream for MultiTopicConsum
         self.remove_consumers(&topics_to_remove);
         if let Some(result) = result {
             return Poll::Ready(Some(Ok(result)));
+        }
+        if let Some(event) = self.pending_events.pop_front() {
+            return Poll::Ready(Some(Ok(ConsumerItem::Event(event))));
         }
 
         Poll::Pending

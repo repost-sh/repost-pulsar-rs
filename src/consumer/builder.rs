@@ -13,7 +13,7 @@ use crate::{
         options::ConsumerOptions, topic::TopicConsumer, InnerConsumer,
     },
     message::proto::command_subscribe::SubType,
-    reader::{Reader, State},
+    reader::Reader,
     BrokerAddress, Consumer, DeserializeMessage, Error, Executor, Pulsar,
 };
 
@@ -265,6 +265,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
             unacked_message_redelivery_delay: unacked_message_resend_delay,
             options: consumer_options.unwrap_or_default(),
             dead_letter_policy,
+            auto_ack: false,
         };
         Ok((config, topics))
     }
@@ -272,9 +273,29 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
     /// creates a [Consumer] from this builder
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn build<T: DeserializeMessage>(self) -> Result<Consumer<T, Exe>, Error> {
+        // Java: ConsumerBuilderImpl has no rollback; the broker would reset a
+        // durable cursor on every subscribe.
+        if self
+            .consumer_options
+            .as_ref()
+            .is_some_and(|o| o.start_rollback.is_some())
+        {
+            return Err(Error::Custom(
+                "a start rollback is for readers: into_reader".to_string(),
+            ));
+        }
         // would this clone() consume too much memory?
         let (config, joined_topics) = self.clone().validate().await?;
+        self.assemble(config, joined_topics).await
+    }
 
+    /// A consumer of `joined_topics`: one topic consumer each, behind a multi
+    /// consumer when there are several.
+    async fn assemble<T: DeserializeMessage>(
+        self,
+        config: ConsumerConfig,
+        joined_topics: Vec<(String, BrokerAddress)>,
+    ) -> Result<Consumer<T, Exe>, Error> {
         let consumers = try_join_all(joined_topics.into_iter().map(|(topic, addr)| {
             TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone())
         }))
@@ -308,6 +329,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 config,
                 disc_last_message_received: None,
                 disc_messages_received: 0,
+                pending_events: VecDeque::new(),
             };
             if consumer.topic_regex.is_some() {
                 consumer.update_topics();
@@ -319,11 +341,32 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         Ok(Consumer { inner: consumer })
     }
 
-    /// creates a [Reader] from this builder
+    /// creates a [Reader] from this builder: of one topic, or of every
+    /// partition of a partitioned topic
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn into_reader<T: DeserializeMessage>(self) -> Result<Reader<T, Exe>, Error> {
+        let topic = match (&self.topics, &self.topic_regex) {
+            (Some(topics), None) if topics.len() == 1 => topics[0].clone(),
+            _ => {
+                return Err(Error::Custom(
+                    "a reader reads one topic, which may be partitioned".to_string(),
+                ))
+            }
+        };
+        // Java: ReaderBuilderImpl.java:90 rejects both; the broker would
+        // silently prefer the rollback.
+        if self
+            .consumer_options
+            .as_ref()
+            .is_some_and(|o| o.start_rollback.is_some() && o.start_message_id.is_some())
+        {
+            return Err(Error::Custom(
+                "a reader starts at a message id or a rollback, not both".to_string(),
+            ));
+        }
         // would this clone() consume too much memory?
-        let (mut config, mut joined_topics) = self.clone().validate().await?;
+        let (mut config, joined_topics) = self.clone().validate().await?;
+        config.auto_ack = true;
 
         // Internally, the reader interface is implemented as a consumer using an exclusive,
         // non-durable subscription
@@ -334,18 +377,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         warn!("Subscription Type for a reader is `Exclusive`. Resetting.");
         config.sub_type = SubType::Exclusive;
 
-        if joined_topics.len() > 1 {
-            return Err(Error::Custom(
-                "Unable to create a reader - one topic partition max".to_string(),
-            ));
-        }
-
-        let (topic, addr) = joined_topics.pop().unwrap();
-        let consumer = TopicConsumer::new(self.pulsar.clone(), topic, addr, config.clone()).await?;
-
-        Ok(Reader {
-            consumer,
-            state: Some(State::PollingConsumer),
-        })
+        let consumer = self.assemble(config, joined_topics).await?;
+        Ok(Reader { consumer, topic })
     }
 }
