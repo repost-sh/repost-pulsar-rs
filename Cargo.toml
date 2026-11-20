@@ -60,7 +60,7 @@ zstd = { version = "^0.13.2", optional = true }
 env_logger = "^0.11.8"
 serde = { version = "^1.0.216", features = ["derive"] }
 serde_json = "^1.0.133"
-tokio = { version = "^1.42.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "^1.42.0", features = ["macros", "rt-multi-thread", "process"] }
 assert_matches = "1.5.0"
 reqwest = { version = "0.13", features = ["json"] }
 
@@ -79,7 +79,14 @@ default = ["compression", "tokio-runtime", "async-std-runtime", "auth-oauth2"]
 protobuf-src = ["dep:protobuf-src"]
 admin-api = ["dep:reqwest", "reqwest?/native-tls", "serde", "serde_json"]
 telemetry = ["tracing"]
+# Enables the integration tests, which boot a two-broker cluster in Docker.
+cluster-tests = []
 tokio-runtime = ["tokio", "tokio-util", "native-tls", "tokio-native-tls"]
 tokio-rustls-runtime = ["tokio-rustls-runtime-aws-lc-rs"]
 tokio-rustls-runtime-aws-lc-rs = ["tokio", "tokio-util", "webpki-roots", "rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 tokio-rustls-runtime-ring = ["tokio", "tokio-util", "webpki-roots", "rustls/ring", "tokio-rustls/ring"]
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["cluster-tests"]
