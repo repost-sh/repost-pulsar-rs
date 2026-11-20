@@ -236,3 +236,28 @@ async fn a_backed_up_consumer_still_answers_after_its_topic_is_deleted() {
         "check_connection hung after the topic was deleted"
     );
 }
+
+#[tokio::test]
+async fn a_consumer_follows_its_topic_when_the_broker_freezes() {
+    let mut cluster = exclusive().await;
+    let topic = topic("reconnect-freeze");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let survivor = 1 - owner;
+    let pulsar = cluster.client_with_keepalive(survivor).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    publish(&pulsar, &topic, 1..=5).await;
+    let mut delivered = Delivered::default();
+    for message in take(&mut consumer, &mut delivered, 5).await {
+        consumer.ack(&message).await.expect("ack");
+    }
+
+    // The application only waits for messages, so no event wakes the
+    // consumer: it has to notice the dead connection by itself.
+    cluster.pause_broker(owner).await;
+    cluster.wait_owner(&topic, survivor).await;
+    publish(&cluster.client_via(survivor).await, &topic, 6..=10).await;
+
+    collect(&mut consumer, &mut delivered, 10, DEADLINE).await;
+    delivered.assert_exactly_ignoring_earlier(&topic, 6..=10);
+}

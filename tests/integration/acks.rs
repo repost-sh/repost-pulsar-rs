@@ -1,5 +1,5 @@
-//! Acknowledgements reach the broker, including while the application is
-//! behind and the consumer's receive queue is full.
+//! Flow control and acknowledgements: a consumer holds no more than its
+//! receive queue, and acks reach the broker while the application is behind.
 
 use std::time::Duration;
 
@@ -76,4 +76,72 @@ async fn messages_the_application_has_not_read_are_not_redelivered() {
         "a redelivery arrived after all 30 were acked"
     );
     delivered.assert_exactly(&topic, 1..=30);
+}
+
+#[tokio::test]
+async fn a_consumer_holds_no_more_than_its_receive_queue() {
+    let cluster = exclusive().await;
+    let topic = topic("acks-window");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let mut consumer = earliest_consumer_with(
+        &pulsar,
+        &topic,
+        "durable",
+        ConsumerOptions::default().with_receiver_queue_size(3),
+    )
+    .await;
+    publish(&pulsar, &topic, 1..=50).await;
+
+    // The broker dispatches what the permits allow and no more while the
+    // application reads nothing.
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter >= 3)
+        .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter == 3)
+        .await;
+
+    // Reading returns permits, and everything arrives.
+    let mut delivered = Delivered::default();
+    take(&mut consumer, &mut delivered, 50).await;
+    delivered.assert_exactly(&topic, 1..=50);
+}
+
+#[tokio::test]
+async fn a_slow_consumer_holds_one_window_across_reconnects() {
+    let cluster = exclusive().await;
+    let topic = topic("acks-flapping");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let mut consumer = earliest_consumer_with(
+        &pulsar,
+        &topic,
+        "durable",
+        ConsumerOptions::default().with_receiver_queue_size(3),
+    )
+    .await;
+    publish(&pulsar, &topic, 1..=50).await;
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter == 3)
+        .await;
+
+    // The application reads nothing while the topic moves five times. The
+    // three messages it holds already fill the window, so the broker must
+    // not send more after any of the reconnects.
+    for _ in 0..5 {
+        cluster.unload(&topic).await;
+        cluster
+            .wait_subscription(&topic, "durable", |s| !s.consumers.is_empty())
+            .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter == 0)
+        .await;
+
+    let mut delivered = Delivered::default();
+    take(&mut consumer, &mut delivered, 50).await;
+    delivered.assert_exactly(&topic, 1..=50);
 }

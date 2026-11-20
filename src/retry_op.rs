@@ -85,7 +85,7 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
     consumer_id: u64,
     consumer_name: &Option<String>,
     options: &ConsumerOptions,
-    batch_size: u32,
+    window: u32,
 ) -> Result<UnboundedReceiver<Message>, Error> {
     *connection = client.manager.get_connection(&addr).await?;
     let mut current_retries = 0u32;
@@ -133,7 +133,7 @@ pub async fn retry_subscribe_consumer<Exe: Executor>(
         }
         current_retries += 1;
     };
-    send_initial_flow(connection, topic, consumer_id, batch_size).await?;
+    send_initial_flow(connection, topic, consumer_id, window).await?;
     Ok(messages)
 }
 
@@ -164,16 +164,16 @@ pub async fn subscribe_once<Exe: Executor>(
     Ok(messages)
 }
 
-/// Grants the broker its first `batch_size` permits for a new subscription.
+/// Grants the broker its first `window` permits for a new subscription.
 pub async fn send_initial_flow<Exe: Executor>(
     connection: &Arc<Connection<Exe>>,
     topic: &str,
     consumer_id: u64,
-    batch_size: u32,
+    window: u32,
 ) -> Result<(), Error> {
     connection
         .sender()
-        .send_flow(consumer_id, batch_size)
+        .send_flow(consumer_id, window)
         .await
         .map_err(|err| {
             error!("TopicConsumer::send_flow({topic}) error: {err:?}");

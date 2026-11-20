@@ -342,6 +342,15 @@ impl<Exe: Executor> Pulsar<Exe> {
             .map_err(|e| e.into())
     }
 
+    /// A lookup that tries each broker it is sent to once, for a consumer
+    /// that will retry the whole lookup itself.
+    pub(crate) async fn lookup_topic_once(&self, topic: &str) -> Result<BrokerAddress, Error> {
+        self.service_discovery
+            .lookup_topic_retrying(topic, 0)
+            .await
+            .map_err(|e| e.into())
+    }
+
     /// gets the number of partitions for a partitioned topic
     ///
     /// ```rust,no_run

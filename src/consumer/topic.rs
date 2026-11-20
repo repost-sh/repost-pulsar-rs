@@ -38,6 +38,7 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     messages: Pin<Box<MessageIdDataReceiver>>,
     delivery: Arc<Mutex<Delivery>>,
     executor: Arc<Exe>,
+    operation_timeout: Duration,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -67,7 +68,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         } = config.clone();
         let consumer_id =
             consumer_id.unwrap_or_else(|| CONSUMER_ID_GENERATOR.fetch_add(1, Ordering::SeqCst));
-        let batch_size = batch_size.unwrap_or(1000);
+        // The broker never has more than this many messages out to us: the
+        // permits we grant. The smaller of the two settings bounds it.
+        let window = batch_size
+            .unwrap_or(1000)
+            .min(options.receiver_queue_size.unwrap_or(1000))
+            .max(1);
         let mut connection = client.manager.get_connection(&addr).await?;
 
         let messages = retry_subscribe_consumer(
@@ -80,7 +86,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             consumer_id,
             &consumer_name,
             &options,
-            batch_size,
+            window,
         )
         .await?;
 
@@ -105,9 +111,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 return Err(Error::Executor);
             }
         }
-        let receiver_queue_size = options.receiver_queue_size.unwrap_or(1000);
-        let (tx, rx) = mpsc::channel(receiver_queue_size as usize);
-        let delivery = Arc::new(Mutex::new(Delivery::default()));
+        // Unbounded, because the permits already bound it.
+        let (tx, rx) = mpsc::unbounded();
+        let delivery = Arc::new(Mutex::new(Delivery::new(
+            window,
+            unacked_message_redelivery_delay.is_some(),
+        )));
         let mut c = ConsumerEngine::new(
             client.clone(),
             connection.clone(),
@@ -120,7 +129,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             messages,
             delivery.clone(),
             engine_rx,
-            batch_size,
+            window,
             unacked_message_redelivery_delay,
             dead_letter_policy.clone(),
             options.clone(),
@@ -143,6 +152,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             messages: Box::pin(rx),
             delivery,
             executor: client.executor.clone(),
+            operation_timeout: client.operation_retry_options.operation_timeout,
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,
@@ -268,9 +278,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         // Java: ConsumerImpl.java:3043 seekAsyncInternal retries until the
         // operation timeout, so a seek survives a broker failover. A seek
         // that failed would leave the reconnect's start filter in place.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + self.operation_timeout;
         let mut delay = Duration::from_millis(100);
         let result = loop {
+            // A reconnect may have taken the target meanwhile; the next
+            // reconnect, after this attempt, needs it again.
+            self.delivery.lock().unwrap().seek_target = message_id.clone();
             let attempt = match self.connection().await {
                 Ok(connection) => connection
                     .sender()
@@ -289,10 +302,17 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         };
         if result.is_err() {
             let mut delivery = self.delivery.lock().unwrap();
-            // a reconnect since then owns the state
             if delivery.epoch == epoch {
                 delivery.epoch -= 1;
                 (delivery.last, delivery.first_queued, delivery.seek_target) = before;
+            } else {
+                // a reconnect applied the target, but the broker never moved
+                delivery.seek_target = None;
+                if let Some(target) = message_id {
+                    let _ = self
+                        .engine_tx
+                        .unbounded_send(EngineMessage::CancelSeek(target));
+                }
             }
         }
         result?;
@@ -376,12 +396,30 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
                 Poll::Ready(Some(Ok((epoch, id, payload)))) => {
                     // C++: lib/ConsumerImpl.cc:1162 receiveHelper drops messages
                     // that arrived on an earlier connection.
-                    {
+                    let flow = {
                         let mut delivery = self.delivery.lock().unwrap();
+                        delivery.queued = delivery.queued.saturating_sub(1);
                         if epoch != delivery.epoch {
+                            // its slot in the window is free for the new
+                            // connection now
+                            if let Some(permits) = delivery.free_permit() {
+                                let _ = self
+                                    .engine_tx
+                                    .unbounded_send(EngineMessage::Flow(delivery.epoch, permits));
+                            }
                             continue;
                         }
                         delivery.last = Some(id.clone());
+                        if let Some(taken) = &mut delivery.taken {
+                            taken.push((id.clone(), std::time::Instant::now()));
+                        }
+                        // Java: ConsumerImpl.java:2253 messageProcessed
+                        delivery.free_permit()
+                    };
+                    if let Some(permits) = flow {
+                        let _ = self
+                            .engine_tx
+                            .unbounded_send(EngineMessage::Flow(epoch, permits));
                     }
                     self.last_message_received = Some(Utc::now());
                     self.messages_received += 1;

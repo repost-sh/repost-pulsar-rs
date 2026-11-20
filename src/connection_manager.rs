@@ -254,7 +254,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             broker_url: format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(6650)),
             proxy: false,
         };
-        manager.connect(broker_address).await?;
+        let retries = manager.connection_retry_options.max_retries;
+        manager.connect(broker_address, retries).await?;
         Ok(manager)
     }
 
@@ -286,6 +287,19 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     pub async fn get_connection(
         &self,
         broker: &BrokerAddress,
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
+        self.get_connection_retrying(broker, self.connection_retry_options.max_retries)
+            .await
+    }
+
+    /// Like [`Self::get_connection`], but a new connection is attempted at
+    /// most `retries + 1` times. A consumer that reconnects passes 0: when the
+    /// broker does not answer, the topic may have moved, and the consumer
+    /// looks it up again instead of waiting on the same address.
+    pub(crate) async fn get_connection_retrying(
+        &self,
+        broker: &BrokerAddress,
+        retries: u32,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         trace!("Looking for connection to {}...", broker.url);
         let rx = {
@@ -321,7 +335,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         match rx {
             None => {
                 info!("No existing connection, creating new for {}", broker.url);
-                self.connect(broker.clone()).await
+                self.connect(broker.clone(), retries).await
             }
             Some(rx) => match rx.await {
                 Ok(res) => {
@@ -333,6 +347,10 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
+    pub(crate) fn connection_retry_options(&self) -> &ConnectionRetryOptions {
+        &self.connection_retry_options
+    }
+
     /// How long to wait before retry number `attempt` (counting from 0): an
     /// exponential backoff from `min_backoff`, capped at `max_backoff`, plus
     /// jitter so clients that lost a broker together do not retry together.
@@ -340,15 +358,16 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         let options = &self.connection_retry_options;
         let jitter = rand::thread_rng().gen_range(0..10);
         std::cmp::min(
-            options.min_backoff * 2u32.saturating_pow(attempt),
+            options.min_backoff * 2u32.saturating_pow(attempt) + options.min_backoff * jitter,
             options.max_backoff,
-        ) + options.min_backoff * jitter
+        )
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn connect_inner(
         &self,
         broker: &BrokerAddress,
+        retries: u32,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         let rx = {
             match self
@@ -404,7 +423,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             {
                 Ok(c) => break c,
                 Err(e) if e.establish_retryable() => {
-                    if current_retries >= self.connection_retry_options.max_retries {
+                    if current_retries >= retries {
                         return Err(e);
                     }
 
@@ -455,8 +474,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     async fn connect(
         &self,
         broker: BrokerAddress,
+        retries: u32,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let c = match self.connect_inner(&broker).await {
+        let c = match self.connect_inner(&broker, retries).await {
             Err(e) => {
                 // the current ConnectionStatus is Connecting, containing
                 // notification channels for all the tasks waiting for the

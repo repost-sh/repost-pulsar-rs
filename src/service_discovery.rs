@@ -35,6 +35,17 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         &self,
         topic: S,
     ) -> Result<BrokerAddress, ServiceDiscoveryError> {
+        let retries = self.manager.connection_retry_options().max_retries;
+        self.lookup_topic_retrying(topic, retries).await
+    }
+
+    /// Like [`Self::lookup_topic`], but every connection the lookup opens is
+    /// attempted at most `retries + 1` times.
+    pub(crate) async fn lookup_topic_retrying<S: Into<String>>(
+        &self,
+        topic: S,
+        retries: u32,
+    ) -> Result<BrokerAddress, ServiceDiscoveryError> {
         let topic = topic.into();
         let mut proxied_query = false;
         let mut conn = self.manager.get_base_connection().await?;
@@ -55,7 +66,10 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                 Ok(res) => res,
                 Err(ConnectionError::Disconnected) => {
                     error!("tried to lookup a topic but connection was closed, reconnecting...");
-                    conn = self.manager.get_connection(&broker_address).await?;
+                    conn = self
+                        .manager
+                        .get_connection_retrying(&broker_address, retries)
+                        .await?;
                     conn.sender()
                         .lookup_topic(topic.to_string(), is_authoritative)
                         .await?
@@ -161,13 +175,16 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
             // if the response indicated a redirect, do another query
             // to the target broker
             if redirect {
-                conn = self.manager.get_connection(&broker_address).await?;
+                conn = self
+                    .manager
+                    .get_connection_retrying(&broker_address, retries)
+                    .await?;
                 proxied_query = broker_address.proxy;
                 continue;
             } else {
                 let res = self
                     .manager
-                    .get_connection(&broker_address)
+                    .get_connection_retrying(&broker_address, retries)
                     .await
                     .map(|_| broker_address)
                     .map_err(ServiceDiscoveryError::Connection);

@@ -20,7 +20,9 @@ pub struct ConsumerOptions {
     pub metadata: BTreeMap<String, String>,
     pub read_compacted: Option<bool>,
     pub schema: Option<Schema>,
-    /// size of the receiver queue
+    /// The most messages each topic or partition consumer holds for the
+    /// application. The broker sends no more than this, or the batch size if
+    /// that is smaller, until the application takes some (default 1000).
     pub receiver_queue_size: Option<u32>,
     /// Signal whether the subscription will initialize on latest
     /// or earliest message (default on latest)

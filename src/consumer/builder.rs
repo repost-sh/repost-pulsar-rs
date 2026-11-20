@@ -140,10 +140,12 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         self
     }
 
-    /// sets the batch size
+    /// sets the most messages the broker may have out to each topic or
+    /// partition consumer before the application takes some
     ///
-    /// batch messages containing more than the configured batch size will
-    /// not be sent by Pulsar
+    /// The receiver queue size bounds the same number; the smaller of the two
+    /// applies. Permits go back to the broker as the application takes
+    /// messages, half the window at a time.
     ///
     /// default value: 1000
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]

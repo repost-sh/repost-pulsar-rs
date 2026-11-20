@@ -43,6 +43,9 @@ const FAILOVER_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Cluster {
     /// Brokers this harness stopped and has not started again.
     down: [bool; 2],
+    /// Brokers this harness froze. Their metadata session expires meanwhile,
+    /// so they come back as a new process rather than unpaused.
+    frozen: [bool; 2],
 }
 
 static CLUSTER: OnceCell<Mutex<Cluster>> = OnceCell::const_new();
@@ -248,7 +251,10 @@ async fn boot() -> Cluster {
     for broker in 0..BROKERS.len() {
         wait_healthy(broker).await;
     }
-    Cluster { down: [false; 2] }
+    Cluster {
+        down: [false; 2],
+        frozen: [false; 2],
+    }
 }
 
 /// Starts an existing container as it is, or creates it.
@@ -257,6 +263,8 @@ async fn boot() -> Cluster {
 /// the address the other containers use.
 async fn up(exists: bool, container: Container<'_>) {
     if exists {
+        // a test that froze a broker and then failed leaves it paused
+        docker_ok(&["unpause", container.name]).await;
         docker(&["start", container.name]).await;
         return;
     }
@@ -292,8 +300,11 @@ struct TopicStats {
 pub struct SubscriptionStats {
     /// Messages not yet acknowledged.
     pub msg_backlog: u64,
-    /// Messages dispatched to the subscription's consumers, buffered or not.
+    /// Messages dispatched to the subscription's consumers, buffered or not,
+    /// since the topic was last loaded.
     pub msg_out_counter: u64,
+    #[serde(default)]
+    pub consumers: Vec<serde::de::IgnoredAny>,
 }
 
 impl Cluster {
@@ -301,6 +312,23 @@ impl Cluster {
     pub async fn client(&self) -> Pulsar<TokioExecutor> {
         let broker = self.running().next().expect("a running broker");
         self.client_via(broker).await
+    }
+
+    /// Like [`Cluster::client_via`], with a fast keepalive so a frozen broker
+    /// is noticed within seconds.
+    pub async fn client_with_keepalive(&self, broker: usize) -> Pulsar<TokioExecutor> {
+        Pulsar::builder(service_url(broker), TokioExecutor)
+            .with_connection_retry_options(pulsar::ConnectionRetryOptions {
+                keep_alive: Duration::from_secs(1),
+                ..Default::default()
+            })
+            .with_operation_retry_options(pulsar::OperationRetryOptions {
+                operation_timeout: Duration::from_secs(3),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .expect("connect to the cluster")
     }
 
     /// A client whose lookups go through `broker`. Fault tests bootstrap
@@ -458,7 +486,20 @@ impl Cluster {
         docker(&["stop", "--time", "90", BROKERS[broker]]).await;
     }
 
+    /// Freezes a broker: its sockets stay open and silent, as when a host
+    /// stops answering, so only a keepalive notices.
+    pub async fn pause_broker(&mut self, broker: usize) {
+        self.down[broker] = true;
+        self.frozen[broker] = true;
+        docker(&["pause", BROKERS[broker]]).await;
+    }
+
     pub async fn start_broker(&mut self, broker: usize) {
+        if self.frozen[broker] {
+            docker_ok(&["unpause", BROKERS[broker]]).await;
+            docker(&["kill", BROKERS[broker]]).await;
+            self.frozen[broker] = false;
+        }
         wait_healthy(broker).await;
         self.down[broker] = false;
     }
