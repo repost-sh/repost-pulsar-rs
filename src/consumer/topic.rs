@@ -37,6 +37,7 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     topic: String,
     messages: Pin<Box<MessageIdDataReceiver>>,
     delivery: Arc<Mutex<Delivery>>,
+    executor: Arc<Exe>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -141,6 +142,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             topic,
             messages: Box::pin(rx),
             delivery,
+            executor: client.executor.clone(),
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,
@@ -245,12 +247,14 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         timestamp: Option<u64>,
     ) -> Result<(), Error> {
         let consumer_id = self.consumer_id;
-        let connection = self.connection().await?;
         // The broker closes the consumer before it confirms the seek, so the
         // engine's reconnect has to find the target before the request goes.
         // Java: ConsumerImpl.java:3048 seekAsyncInternal sets seekMessageId
         // first and restores it if the seek fails.
-        let before = {
+        // Raising the epoch keeps what is buffered from before the seek from
+        // reaching the application, as Java clears the queue first.
+        // Java: MultiTopicsConsumerImpl.java:944 beforeSeek
+        let (epoch, before) = {
             let mut delivery = self.delivery.lock().unwrap();
             let before = (
                 delivery.last.take(),
@@ -258,15 +262,38 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 delivery.seek_target.clone(),
             );
             delivery.seek_target = message_id.clone();
-            before
+            delivery.epoch += 1;
+            (delivery.epoch, before)
         };
-        let result = connection
-            .sender()
-            .seek(consumer_id, message_id, timestamp)
-            .await;
+        // Java: ConsumerImpl.java:3043 seekAsyncInternal retries until the
+        // operation timeout, so a seek survives a broker failover. A seek
+        // that failed would leave the reconnect's start filter in place.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut delay = Duration::from_millis(100);
+        let result = loop {
+            let attempt = match self.connection().await {
+                Ok(connection) => connection
+                    .sender()
+                    .seek(consumer_id, message_id.clone(), timestamp)
+                    .await
+                    .map(drop),
+                Err(e) => Err(ConnectionError::Unexpected(e.to_string())),
+            };
+            match attempt {
+                Err(e) if may_succeed_later(&e) && std::time::Instant::now() < deadline => {
+                    self.executor.delay(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                result => break result,
+            }
+        };
         if result.is_err() {
             let mut delivery = self.delivery.lock().unwrap();
-            (delivery.last, delivery.first_queued, delivery.seek_target) = before;
+            // a reconnect since then owns the state
+            if delivery.epoch == epoch {
+                delivery.epoch -= 1;
+                (delivery.last, delivery.first_queued, delivery.seek_target) = before;
+            }
         }
         result?;
         Ok(())
@@ -366,5 +393,16 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
                 }
             }
         }
+    }
+}
+
+/// Failures of a request that a retry after a reconnect can fix.
+fn may_succeed_later(error: &ConnectionError) -> bool {
+    match error {
+        ConnectionError::Io(_) | ConnectionError::Disconnected | ConnectionError::SlowDown => true,
+        ConnectionError::PulsarError(kind, _) => {
+            *kind == Some(crate::message::proto::ServerError::ServiceNotReady)
+        }
+        _ => false,
     }
 }

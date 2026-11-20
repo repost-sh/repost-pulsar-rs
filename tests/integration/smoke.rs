@@ -3,7 +3,7 @@
 use futures::TryStreamExt;
 
 use crate::{
-    cluster::{exclusive, topic, Cluster},
+    cluster::{exclusive, partition, topic, Cluster},
     delivery::earliest_consumer,
 };
 
@@ -59,7 +59,7 @@ async fn unload_and_partition_updates_take_effect() {
         .expect("partitioned metadata");
     assert_eq!(partitions, 3);
 
-    let partition = format!("{topic}-partition-2");
+    let partition = partition(&topic, 2);
     cluster.unload(&partition).await;
     assert_eq!(
         round_trip(&cluster, &partition, "after unload").await,

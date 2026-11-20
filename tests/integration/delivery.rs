@@ -3,9 +3,13 @@
 
 use std::{collections::BTreeMap, ops::RangeInclusive, time::Duration};
 
+/// Long enough for a broker to fail over and a consumer to reconnect.
+pub const DEADLINE: Duration = Duration::from_secs(90);
+
 use futures::{Stream, StreamExt, TryStreamExt};
 use pulsar::{
     consumer::{InitialPosition, Message},
+    reader::Reader,
     Consumer, ConsumerOptions, Error, Pulsar, SubType, TokioExecutor,
 };
 
@@ -15,15 +19,61 @@ pub async fn earliest_consumer(
     topic: &str,
     subscription: &str,
 ) -> Consumer<String, TokioExecutor> {
+    earliest_consumer_with(pulsar, topic, subscription, ConsumerOptions::default()).await
+}
+
+/// [`earliest_consumer`] with other options as well.
+pub async fn earliest_consumer_with(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+    subscription: &str,
+    options: ConsumerOptions,
+) -> Consumer<String, TokioExecutor> {
     pulsar
         .consumer()
         .with_topic(topic)
         .with_subscription(subscription)
         .with_subscription_type(SubType::Exclusive)
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
+        .with_options(options.with_initial_position(InitialPosition::Earliest))
         .build()
         .await
         .expect("consumer")
+}
+
+/// A reader that starts at the earliest message.
+pub async fn earliest_reader(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+    subscription: &str,
+) -> Reader<String, TokioExecutor> {
+    pulsar
+        .reader()
+        .with_topic(topic)
+        .with_subscription(subscription)
+        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
+        .into_reader()
+        .await
+        .expect("reader")
+}
+
+/// Publishes `before` on each topic, then `after`, and returns a publish time
+/// in milliseconds that falls between the two.
+pub async fn publish_around_a_time(
+    pulsar: &Pulsar<TokioExecutor>,
+    topics: &[String],
+    before: RangeInclusive<u64>,
+    after: RangeInclusive<u64>,
+) -> u64 {
+    for topic in topics {
+        publish(pulsar, topic, before.clone()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let middle = chrono::Utc::now().timestamp_millis() as u64;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for topic in topics {
+        publish(pulsar, topic, after.clone()).await;
+    }
+    middle
 }
 
 pub async fn publish(pulsar: &Pulsar<TokioExecutor>, topic: &str, numbers: RangeInclusive<u64>) {
@@ -62,15 +112,18 @@ impl Delivered {
             .push(number);
     }
 
-    fn distinct(&self) -> usize {
+    /// How many different numbers `topic` delivered.
+    pub fn distinct_on(&self, topic: &str) -> usize {
+        let mut numbers = self.by_topic.get(topic).cloned().unwrap_or_default();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers.len()
+    }
+
+    pub fn distinct(&self) -> usize {
         self.by_topic
-            .values()
-            .map(|numbers| {
-                let mut numbers = numbers.clone();
-                numbers.sort_unstable();
-                numbers.dedup();
-                numbers.len()
-            })
+            .keys()
+            .map(|topic| self.distinct_on(topic))
             .sum()
     }
 

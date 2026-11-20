@@ -895,8 +895,8 @@ mod tests {
                 .build::<String>()
                 .await
                 .unwrap();
-            let last_msg_ids = reader.get_last_message_id().await.unwrap();
-            let last_msg_id = last_msg_ids.first().unwrap();
+            let last_msg_ids = reader.last_message_ids().await.unwrap();
+            let last_msg_id = last_msg_ids.values().next().unwrap();
             if last_msg_id.ledger_id != u64::MAX && last_msg_id.entry_id != u64::MAX {
                 assert_eq!(last_msg_id.ledger_id, msg_id.ledger_id);
                 assert_eq!(last_msg_id.entry_id, msg_id.entry_id);

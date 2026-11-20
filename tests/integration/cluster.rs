@@ -71,6 +71,11 @@ pub fn topic(prefix: &str) -> String {
     topic_in(NAMESPACE, prefix)
 }
 
+/// The name of partition `index` of a partitioned topic.
+pub fn partition(topic: &str, index: u32) -> String {
+    format!("{topic}-partition-{index}")
+}
+
 /// A fresh topic name in `namespace`.
 pub fn topic_in(namespace: &str, prefix: &str) -> String {
     format!("persistent://{namespace}/{prefix}-{}", uuid::Uuid::new_v4())

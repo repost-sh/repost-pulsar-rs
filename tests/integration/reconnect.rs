@@ -1,17 +1,13 @@
 //! What a consumer delivers when the broker moves its topic: after an unload,
 //! a rolling restart or a crash, every message arrives once and in order.
 
-use std::time::Duration;
-
 use futures::StreamExt;
-use pulsar::{consumer::InitialPosition, reader::Reader, ConsumerOptions, TokioExecutor};
+use pulsar::{reader::Reader, ConsumerOptions, TokioExecutor};
 
 use crate::{
     cluster::{exclusive, topic, topic_in, STRICT_NAMESPACE},
-    delivery::{collect, earliest_consumer, publish, take, Delivered},
+    delivery::{collect, earliest_consumer, earliest_reader, publish, take, Delivered, DEADLINE},
 };
-
-const DEADLINE: Duration = Duration::from_secs(90);
 
 #[tokio::test]
 async fn an_unloaded_consumer_does_not_deliver_its_stale_buffer_again() {
@@ -48,14 +44,7 @@ async fn an_unloaded_reader_resumes_after_its_last_delivered_message() {
     cluster.create_topic(&topic).await;
     let pulsar = cluster.client().await;
     publish(&pulsar, &topic, 1..=20).await;
-    let mut reader: Reader<String, TokioExecutor> = pulsar
-        .reader()
-        .with_topic(&topic)
-        .with_subscription("reader")
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
-        .into_reader()
-        .await
-        .expect("reader");
+    let mut reader = earliest_reader(&pulsar, &topic, "reader").await;
 
     let mut delivered = Delivered::default();
     take(&mut reader, &mut delivered, 5).await;
@@ -180,14 +169,7 @@ async fn a_reader_that_seeks_back_reads_again_from_there() {
     cluster.create_topic(&topic).await;
     let pulsar = cluster.client().await;
     publish(&pulsar, &topic, 1..=10).await;
-    let mut reader: Reader<String, TokioExecutor> = pulsar
-        .reader()
-        .with_topic(&topic)
-        .with_subscription("seek")
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
-        .into_reader()
-        .await
-        .expect("reader");
+    let mut reader = earliest_reader(&pulsar, &topic, "seek").await;
     let first_pass = take(&mut reader, &mut Delivered::default(), 10).await;
 
     reader
@@ -210,7 +192,7 @@ async fn a_consumer_reports_a_deleted_topic_and_ends() {
     let topic = topic_in(STRICT_NAMESPACE, "reconnect-deleted");
     cluster.create_topic(&topic).await;
     let pulsar = cluster.client().await;
-    let mut consumer = crate::delivery::earliest_consumer(&pulsar, &topic, "durable").await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
 
     cluster.delete_topic(&topic).await;
 
@@ -225,4 +207,32 @@ async fn a_consumer_reports_a_deleted_topic_and_ends() {
         .await
         .expect("the stream ends within the deadline");
     assert!(end.is_none(), "expected the end of the stream, got {end:?}");
+}
+
+#[tokio::test]
+async fn a_backed_up_consumer_still_answers_after_its_topic_is_deleted() {
+    let cluster = exclusive().await;
+    cluster.ensure_strict_namespace().await;
+    let topic = topic_in(STRICT_NAMESPACE, "reconnect-deleted-full");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let mut consumer = crate::delivery::earliest_consumer_with(
+        &pulsar,
+        &topic,
+        "durable",
+        ConsumerOptions::default().with_receiver_queue_size(3),
+    )
+    .await;
+    publish(&pulsar, &topic, 1..=10).await;
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter >= 3)
+        .await;
+
+    cluster.delete_topic(&topic).await;
+
+    let answer = tokio::time::timeout(DEADLINE, consumer.check_connection()).await;
+    assert!(
+        answer.is_ok(),
+        "check_connection hung after the topic was deleted"
+    );
 }

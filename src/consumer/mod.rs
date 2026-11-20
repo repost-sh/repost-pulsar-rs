@@ -12,7 +12,7 @@ pub mod options;
 pub mod topic;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     pin::Pin,
     time::Duration,
 };
@@ -23,7 +23,7 @@ pub use data::{DeadLetterPolicy, EngineMessage};
 use futures::{
     future::try_join_all,
     task::{Context, Poll},
-    Stream, StreamExt,
+    Stream,
 };
 pub use initial_position::InitialPosition;
 pub use message::Message;
@@ -33,7 +33,7 @@ pub use topic::TopicConsumer;
 use url::Url;
 
 use crate::{
-    error::{ConsumerError, Error},
+    error::{ConnectionError, ConsumerError, Error},
     executor::Executor,
     message::proto::{command_subscribe::SubType, MessageIdData, Schema},
     proto::CommandConsumerStatsResponse,
@@ -178,70 +178,43 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
-    /// seek currently destroys the existing consumer and creates a new one
-    /// this is how java and cpp pulsar client implement this feature mainly because
-    /// there are many minor problems with flushing existing messages and receiving new ones
+    /// Restarts `topic` right after `message_id`: the next message from that
+    /// topic or partition is the one following `message_id`. Messages already
+    /// buffered from before the seek are not delivered. Every other topic keeps
+    /// its position and its buffered messages.
+    ///
+    /// `topic` names the topic the id belongs to: for a partitioned topic, the
+    /// partition, such as `persistent://public/default/orders-partition-3`,
+    /// which is what [`Message::topic`] holds. Short names like `orders` mean
+    /// `persistent://public/default/orders`.
+    // Java: MultiTopicsConsumerImpl.java:895 seekAsync(MessageId), routed to the
+    // partition that owns the id
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn seek(
-        &mut self,
-        consumer_ids: Option<Vec<String>>,
-        message_id: Option<MessageIdData>,
-        timestamp: Option<u64>,
-        client: Pulsar<Exe>,
-    ) -> Result<(), Error> {
-        let inner_consumer: InnerConsumer<T, Exe> = match &mut self.inner {
-            InnerConsumer::Single(c) => {
-                c.seek(message_id, timestamp).await?;
-                let topic = c.topic().to_string();
-                let addr = client.lookup_topic(&topic).await?;
-                let config = c.config().clone();
-                InnerConsumer::Single(TopicConsumer::new(client, topic, addr, config).await?)
-            }
-            InnerConsumer::Multi(c) => {
-                c.seek(consumer_ids, message_id, timestamp).await?;
-                let topics = c.topics();
-                let config = c.config().clone();
+    pub async fn seek_to(&mut self, topic: &str, message_id: MessageIdData) -> Result<(), Error> {
+        let topic = full_topic_name(topic);
+        let consumer = self
+            .topic_consumers()
+            .into_iter()
+            .find(|c| full_topic_name(&c.topic()) == topic)
+            .ok_or_else(|| {
+                Error::Connection(ConnectionError::Unexpected(format!(
+                    "no consumer for topic {topic}"
+                )))
+            })?;
+        consumer.seek(Some(message_id), None).await
+    }
 
-                //currently, pulsar only supports seek for non partitioned topics
-                let addrs =
-                    try_join_all(topics.into_iter().map(|topic| client.lookup_topic(topic)))
-                        .await?;
-
-                let topic_addr_pair = c.topics.iter().cloned().zip(addrs.iter().cloned());
-
-                let consumers = try_join_all(topic_addr_pair.map(|(topic, addr)| {
-                    TopicConsumer::new(client.clone(), topic, addr, config.clone())
-                }))
-                .await?;
-
-                let consumers: BTreeMap<_, _> = consumers
-                    .into_iter()
-                    .map(|c| (c.topic(), Box::pin(c)))
-                    .collect();
-                let topics: VecDeque<String> = consumers.keys().cloned().collect();
-                let existing_topics = topics.clone();
-                let topic_refresh = Duration::from_secs(30);
-                let refresh = Box::pin(client.executor.interval(topic_refresh).map(drop));
-                let namespace = c.namespace.clone();
-                let config = c.config().clone();
-                let topic_regex = c.topic_regex.clone();
-                InnerConsumer::Multi(MultiTopicConsumer {
-                    namespace,
-                    topic_regex,
-                    pulsar: client,
-                    consumers,
-                    topics,
-                    existing_topics,
-                    new_consumers: None,
-                    refresh,
-                    config,
-                    disc_last_message_received: None,
-                    disc_messages_received: 0,
-                })
-            }
-        };
-
-        self.inner = inner_consumer;
+    /// Restarts every topic and partition at the first message published at or
+    /// after `publish_time_ms`, in milliseconds since the Unix epoch.
+    // Java: MultiTopicsConsumerImpl.java:926 seekAsync(long)
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn seek_to_time(&mut self, publish_time_ms: u64) -> Result<(), Error> {
+        try_join_all(
+            self.topic_consumers()
+                .into_iter()
+                .map(|c| c.seek(None, Some(publish_time_ms))),
+        )
+        .await?;
         Ok(())
     }
 
@@ -261,11 +234,24 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
+    /// The id of the last message published on each topic or partition, keyed
+    /// by the name this consumer reads it under.
+    // Java: MultiTopicsConsumerImpl.java getLastMessageIdsAsync
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn get_last_message_id(&mut self) -> Result<Vec<MessageIdData>, Error> {
+    pub async fn last_message_ids(&mut self) -> Result<BTreeMap<String, MessageIdData>, Error> {
+        let ids =
+            try_join_all(self.topic_consumers().into_iter().map(|c| async move {
+                Ok::<_, Error>((c.topic(), c.get_last_message_id().await?))
+            }))
+            .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// The consumer of each topic or partition this consumer reads.
+    fn topic_consumers(&mut self) -> Vec<&mut TopicConsumer<T, Exe>> {
         match &mut self.inner {
-            InnerConsumer::Single(c) => Ok(vec![c.get_last_message_id().await?]),
-            InnerConsumer::Multi(c) => c.get_last_message_id().await,
+            InnerConsumer::Single(c) => vec![c],
+            InnerConsumer::Multi(c) => c.consumers.values_mut().map(|c| &mut **c).collect(),
         }
     }
 
@@ -420,6 +406,19 @@ impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Consumer<T, Exe>
             InnerConsumer::Single(c) => Pin::new(c).poll_next(cx),
             InnerConsumer::Multi(c) => Pin::new(c).poll_next(cx),
         }
+    }
+}
+
+/// The fully qualified name Pulsar uses for `topic`, so that `orders`,
+/// `public/default/orders` and `persistent://public/default/orders` match.
+// Java: pulsar-common/.../naming/TopicName.java
+fn full_topic_name(topic: &str) -> String {
+    if topic.contains("://") {
+        return topic.to_string();
+    }
+    match topic.split('/').count() {
+        1 => format!("persistent://public/default/{topic}"),
+        _ => format!("persistent://{topic}"),
     }
 }
 
@@ -1374,10 +1373,7 @@ mod tests {
         log::info!("calling seek method");
         // Seek in a separate task, to verify that the seek future is `Send`. See #255.
         let mut consumer_1 = tokio::task::spawn(async move {
-            consumer_1
-                .seek(None, None, Some(start_time), client)
-                .await
-                .unwrap();
+            consumer_1.seek_to_time(start_time).await.unwrap();
             consumer_1
         })
         .await

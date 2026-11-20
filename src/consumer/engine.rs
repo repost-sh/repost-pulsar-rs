@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -41,6 +41,11 @@ pub struct ConsumerEngine<Exe: Executor> {
     id: u64,
     name: Option<String>,
     tx: mpsc::Sender<Result<(u64, MessageIdData, Payload), Error>>,
+    /// What is waiting for room in the consumer's queue. Parking it here, not
+    /// blocking on `tx`, keeps acks, seeks and connection requests flowing
+    /// while the application is behind. No flow permits go out while it is
+    /// not empty, so the broker cannot fill it beyond the permits it has.
+    pending: VecDeque<Result<(u64, MessageIdData, Payload), Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     delivery: Arc<Mutex<Delivery>>,
     /// The epoch of the current connection, as last written to `delivery`.
@@ -93,6 +98,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             id,
             name,
             tx,
+            pending: VecDeque::new(),
             messages_rx: Some(messages_rx),
             delivery,
             epoch: 0,
@@ -191,7 +197,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = 4294967096, no flow message trigger) [underflow on remaining messages - without the patch]
             // BatchMessage (1024) -> (batch_size = 1000, remaining_messages = -1124, flow message trigger, ask broker to send =>  batch_size - remaining_messages = 2124) [no underflow on remaining messages - with the patch]
             // ```
-            if self.remaining_messages < (self.batch_size.div_ceil(2) as i64) {
+            if self.pending.is_empty()
+                && self.remaining_messages < (self.batch_size.div_ceil(2) as i64)
+            {
                 match self
                     .connection
                     .sender()
@@ -217,7 +225,19 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.remaining_messages = self.batch_size as i64;
             }
 
-            match Self::timeout(self.event_rx.next(), Duration::from_secs(1)).await {
+            let event = if self.pending.is_empty() {
+                Self::timeout(self.event_rx.next(), Duration::from_secs(1)).await
+            } else {
+                match self.room_or_event().await {
+                    // a closed queue makes the flush fail, which ends the engine
+                    futures::future::Either::Left(()) => {
+                        self.flush_pending()?;
+                        continue;
+                    }
+                    futures::future::Either::Right(event) => Ok(event),
+                }
+            };
+            match event {
                 Err(_) => {
                     // If you are reading this comment, you may have an issue where you have
                     // received a batched message that is greater that the batch
@@ -284,14 +304,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     Ok(true) => None,
                     // End of Topic
                     Ok(false) => Some(Ok(())),
-                    Err(e) => {
-                        if let Err(e) = self.tx.send(Err(e)).await {
-                            error!("cannot send a message from the consumer engine to the consumer({}), stopping the engine", self.id);
-                            Some(Err(Error::Consumer(e.into())))
-                        } else {
-                            None
-                        }
-                    }
+                    Err(e) => self.park(Err(e)).err().map(Err),
                 }
             }
         }
@@ -649,20 +662,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
             self.first_queued_known = true;
         }
-        let tracked = self
-            .unacked_message_redelivery_delay
-            .map(|delay| (message_id.clone(), Instant::now() + delay));
-        self.tx
-            .send(Ok((self.epoch, message_id, payload)))
-            .await
-            .map_err(|e| {
-                error!("tx returned {:?}", e);
-                Error::Custom("tx closed".to_string())
-            })?;
-        if let Some((message_id, deadline)) = tracked {
-            self.unacked_messages.insert(message_id, deadline);
-        }
-        Ok(())
+        self.park(Ok((self.epoch, message_id, payload)))
     }
 
     /// Subscribes again after the connection broke or the broker closed the
@@ -683,6 +683,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             let mut delivery = self.delivery.lock().unwrap();
             delivery.epoch += 1;
             self.epoch = delivery.epoch;
+            self.pending.retain(Result::is_err);
             let non_durable = self.options.durable == Some(false);
             if let Some(target) = delivery.seek_target.take() {
                 // Java: ConsumerImpl.java:3070, after a seek the target becomes
@@ -724,12 +725,32 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
             match self.resubscribe().await {
                 Ok(messages) => {
-                    self.remaining_messages = self.batch_size as i64;
-                    self.messages_rx = Some(messages);
-                    for (message_id, cumulative) in acks {
+                    // Acks sent while disconnected go out before the permits,
+                    // so the broker does not dispatch those messages again.
+                    self.take_queued_acks(&mut acks);
+                    for (message_id, cumulative) in std::mem::take(&mut acks) {
                         self.ack(message_id, cumulative).await;
                     }
-                    return Ok(());
+                    match send_initial_flow(&self.connection, &self.topic, self.id, self.batch_size)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.remaining_messages = self.batch_size as i64;
+                            self.messages_rx = Some(messages);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            let delay = self.client.manager.backoff(attempt);
+                            attempt += 1;
+                            warn!(
+                                "consumer {}: flow after reconnect failed, retrying in {delay:?}: {e}",
+                                self.debug_format()
+                            );
+                            if !self.wait_disconnected(delay, &mut acks).await {
+                                return Err(Error::Consumer(ConsumerError::Closed));
+                            }
+                        }
+                    }
                 }
                 // Java retries everything but a deleted topic; errors that no
                 // retry can fix (permissions, schema) are reported here too.
@@ -738,7 +759,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         "consumer {}: cannot subscribe again: {e}",
                         self.debug_format()
                     );
-                    let _ = self.tx.send(Err(e)).await;
+                    self.deliver_final(e).await;
                     return Err(Error::Consumer(ConsumerError::Closed));
                 }
                 Err(e) => {
@@ -770,7 +791,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             &self.options,
         )
         .await?;
-        send_initial_flow(&self.connection, &self.topic, self.id, self.batch_size).await?;
         Ok(messages)
     }
 
@@ -809,6 +829,94 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 Some(EngineEvent::Message(..)) => {}
                 Some(EngineEvent::EngineMessage(None)) | None => return false,
             }
+        }
+    }
+
+    /// Queues `item` for the consumer and hands over what fits.
+    fn park(&mut self, item: Result<(u64, MessageIdData, Payload), Error>) -> Result<(), Error> {
+        self.pending.push_back(item);
+        self.flush_pending()
+    }
+
+    /// Hands parked messages to the consumer while its queue has room. Fails
+    /// once the application has dropped the consumer.
+    fn flush_pending(&mut self) -> Result<(), Error> {
+        while let Some(item) = self.pending.pop_front() {
+            // the redelivery clock starts once the application can have it
+            let tracked = match (&item, self.unacked_message_redelivery_delay) {
+                (Ok((_, id, _)), Some(delay)) => Some((id.clone(), delay)),
+                _ => None,
+            };
+            match self.tx.try_send(item) {
+                Ok(()) => {
+                    if let Some((id, delay)) = tracked {
+                        self.unacked_messages.insert(id, Instant::now() + delay);
+                    }
+                }
+                Err(e) if e.is_full() => {
+                    self.pending.push_front(e.into_inner());
+                    return Ok(());
+                }
+                Err(_) => {
+                    error!("consumer {}: the consumer is gone", self.debug_format());
+                    return Err(Error::Consumer(ConsumerError::Closed));
+                }
+            }
+        }
+        // a burst can leave the queue large; do not keep that memory around
+        if self.pending.capacity() > 64 {
+            self.pending.shrink_to(64);
+        }
+        Ok(())
+    }
+
+    /// Takes acks already queued behind the reconnect and answers connection
+    /// requests, without waiting for more.
+    fn take_queued_acks(&mut self, acks: &mut Vec<(MessageIdData, bool)>) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                EngineEvent::EngineMessage(Some(EngineMessage::Ack(id, cumulative))) => {
+                    acks.push((id, cumulative));
+                }
+                EngineEvent::EngineMessage(Some(EngineMessage::GetConnection(sender))) => {
+                    let _ = sender.send(self.connection.clone());
+                }
+                // old frames, and nacks or redelivery ticks the new
+                // subscription makes moot
+                _ => {}
+            }
+        }
+    }
+
+    /// Hands the error the engine stops on to the application, still
+    /// answering connection requests while the consumer's queue is full.
+    async fn deliver_final(&mut self, error: Error) {
+        self.pending.push_back(Err(error));
+        loop {
+            if self.flush_pending().is_err() || self.pending.is_empty() {
+                return;
+            }
+            match self.room_or_event().await {
+                futures::future::Either::Right(Some(EngineEvent::EngineMessage(Some(
+                    EngineMessage::GetConnection(sender),
+                )))) => {
+                    let _ = sender.send(self.connection.clone());
+                }
+                futures::future::Either::Right(None)
+                | futures::future::Either::Right(Some(EngineEvent::EngineMessage(None))) => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// Waits until the consumer's queue has room (left) or another event
+    /// arrives (right), whichever comes first.
+    async fn room_or_event(&mut self) -> futures::future::Either<(), Option<EngineEvent<Exe>>> {
+        let tx = &mut self.tx;
+        let room = futures::future::poll_fn(|cx| tx.poll_ready(cx));
+        match futures::future::select(room, self.event_rx.next()).await {
+            futures::future::Either::Left(_) => futures::future::Either::Left(()),
+            futures::future::Either::Right((event, _)) => futures::future::Either::Right(event),
         }
     }
 

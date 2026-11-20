@@ -42,11 +42,6 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
 
 impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn topics(&self) -> Vec<String> {
-        self.topics.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn existing_topics(&self) -> Vec<String> {
         self.existing_topics.iter().map(|s| s.to_string()).collect()
     }
@@ -90,13 +85,6 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         }
 
         Ok(())
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn get_last_message_id(&mut self) -> Result<Vec<MessageIdData>, Error> {
-        let responses =
-            try_join_all(self.consumers.values_mut().map(|c| c.get_last_message_id())).await?;
-        Ok(responses)
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -272,45 +260,6 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         } else {
             Err(ConnectionError::Unexpected(format!("no consumer for topic {topic}")).into())
         }
-    }
-
-    /// Assume that this seek method will call seek for the topics given in the consumer_ids
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn seek(
-        &mut self,
-        consumer_ids: Option<Vec<String>>,
-        message_id: Option<MessageIdData>,
-        timestamp: Option<u64>,
-    ) -> Result<(), Error> {
-        // 0. null or empty vector
-        match consumer_ids {
-            Some(consumer_ids) => {
-                // 1, select consumers
-                let mut actions = Vec::default();
-                for (consumer_id, consumer) in self.consumers.iter_mut() {
-                    if consumer_ids.contains(consumer_id) {
-                        actions.push(consumer.seek(message_id.clone(), timestamp));
-                    }
-                }
-                // 2 join all the futures
-                let mut v = futures::future::join_all(actions).await;
-
-                for res in v.drain(..) {
-                    res?;
-                }
-
-                Ok(())
-            }
-            None => Err(ConnectionError::Unexpected(format!(
-                "no consumer for consumer ids {consumer_ids:?}"
-            ))
-            .into()),
-        }
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn config(&self) -> &ConsumerConfig {
-        &self.config
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
