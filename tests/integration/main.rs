@@ -22,5 +22,6 @@ mod producer;
 mod reader;
 mod reconnect;
 mod retries;
+mod scale;
 mod seek;
 mod smoke;

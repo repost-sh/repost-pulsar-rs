@@ -4,12 +4,17 @@ use std::{
     future::Future,
     iter,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
     task::{Context, Poll},
 };
 
 use chrono::{DateTime, Utc};
 use futures::{
     future::{join_all, try_join_all},
+    task::{waker_ref, ArcWake, AtomicWaker},
     Stream,
 };
 use regex::Regex;
@@ -30,6 +35,64 @@ use crate::{
     DeserializeMessage, Error, Executor, Pulsar,
 };
 
+/// The topics and partitions woken since they were last polled, in the order
+/// they woke. A poll visits these rather than every one, so a message on one
+/// partition of many costs no pass over the others.
+// Java and C++ get the same from one queue that every partition feeds.
+#[derive(Default)]
+pub(super) struct Woken {
+    queue: Mutex<VecDeque<Arc<TopicWaker>>>,
+    /// The application's task, woken with any topic.
+    task: AtomicWaker,
+}
+
+impl Woken {
+    /// A queue holding `topics`, so the first poll visits each of them.
+    pub(super) fn new(topics: impl IntoIterator<Item = String>) -> Arc<Self> {
+        let woken = Arc::new(Woken::default());
+        for topic in topics {
+            woken.add(topic);
+        }
+        woken
+    }
+
+    /// Queues a new topic; its first poll registers its waker.
+    pub(super) fn add(self: &Arc<Self>, topic: String) {
+        let waker = Arc::new(TopicWaker {
+            topic,
+            queued: AtomicBool::new(true),
+            woken: Arc::downgrade(self),
+        });
+        self.queue.lock().unwrap().push_back(waker);
+    }
+}
+
+/// What one topic consumer is polled with: its wake queues the topic, once
+/// until the next poll, and wakes the application.
+struct TopicWaker {
+    topic: String,
+    queued: AtomicBool,
+    /// Weak, since the queue holds the wakers.
+    woken: Weak<Woken>,
+}
+
+impl TopicWaker {
+    fn queue(self: &Arc<Self>, woken: &Woken) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            woken.queue.lock().unwrap().push_back(self.clone());
+        }
+    }
+}
+
+impl ArcWake for TopicWaker {
+    fn wake_by_ref(this: &Arc<Self>) {
+        if let Some(woken) = this.woken.upgrade() {
+            this.queue(&woken);
+            woken.task.wake();
+        }
+    }
+}
+
 /// A refresh under way; it logs what fails and keeps what it found.
 type Refresh<T, Exe> = Pin<Box<dyn Future<Output = Refreshed<T, Exe>> + Send + Sync>>;
 
@@ -44,7 +107,7 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     /// as last found. A refresh subscribes the partitions past it.
     // Java: MultiTopicsConsumerImpl.java partitionedTopics
     pub(super) partitioned: BTreeMap<String, u32>,
-    pub(super) existing_topics: VecDeque<String>,
+    pub(super) woken: Arc<Woken>,
     /// Every topic and partition ever subscribed, ended ones included, by
     /// full name, so a refresh never subscribes one again.
     pub(super) subscribed: BTreeSet<String>,
@@ -66,7 +129,7 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
 impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn existing_topics(&self) -> Vec<String> {
-        self.existing_topics.iter().map(|s| s.to_string()).collect()
+        self.consumers.keys().cloned().collect()
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -135,7 +198,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
             // a refresh that replaced a stuck one may find it again
             if self.subscribed.insert(full_topic_name(&topic)) {
                 self.consumers.insert(topic.clone(), Box::pin(consumer));
-                self.existing_topics.push_back(topic);
+                self.woken.add(topic.clone());
             }
         }
         self.partitioned.extend(refreshed.partitioned);
@@ -143,7 +206,6 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn remove_consumers(&mut self, topics: &[String]) {
-        self.existing_topics.retain(|t| !topics.contains(t));
         for topic in topics {
             if let Some(consumer) = self.consumers.remove(topic) {
                 if consumer.active {
@@ -451,35 +513,46 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
             return self.poll_next_item(cx);
         }
 
+        // registered before looking, so a wake from here on is not lost
+        self.woken.task.register(cx.waker());
         let mut topics_to_remove = Vec::new();
         let mut result = None;
-        for _ in 0..self.existing_topics.len() {
-            if result.is_some() {
-                break;
-            }
-            let topic = self.existing_topics.pop_front().unwrap();
-            if let Some(item) = self
-                .consumers
-                .get_mut(&topic)
-                .map(|c| c.as_mut().get_mut().poll_next_item(cx))
-            {
-                match item {
-                    Poll::Pending => {}
-                    Poll::Ready(Some(Ok(item))) => result = Some(Ok(item)),
-                    // The engine is gone, after its error: the partition ended.
-                    Poll::Ready(None) => {
-                        error!("consumer of {topic} ended");
-                        topics_to_remove.push(topic.clone());
-                    }
-                    // The engine carries on; the application decides.
-                    Poll::Ready(Some(Err(e))) => result = Some(Err(e)),
+        // each topic queued by now, once
+        let queued = self.woken.queue.lock().unwrap().len();
+        for _ in 0..queued {
+            // only this poll takes from the queue
+            let waker =
+                (self.woken.queue.lock().unwrap().pop_front()).expect("as many queued as counted");
+            // ended since it woke
+            let Some(consumer) = self.consumers.get_mut(&waker.topic) else {
+                continue;
+            };
+            // a wake from here on queues it again
+            waker.queued.store(false, Ordering::Release);
+            let item = consumer
+                .as_mut()
+                .get_mut()
+                .poll_next_item(&mut Context::from_waker(&waker_ref(&waker)));
+            match item {
+                Poll::Pending => {}
+                // An error too: the engine carries on, the application
+                // decides. Either way the topic may hold more, so it goes to
+                // the back, without waking the task this item goes to.
+                Poll::Ready(Some(item)) => {
+                    waker.queue(&self.woken);
+                    result = Some(item);
+                    break;
                 }
-            } else {
-                eprintln!("BUG: Missing consumer for topic {}", topic);
+                // The engine is gone, after its error: the partition ended.
+                Poll::Ready(None) => {
+                    error!("consumer of {} ended", waker.topic);
+                    topics_to_remove.push(waker.topic.clone());
+                }
             }
-            self.existing_topics.push_back(topic);
         }
-        self.remove_consumers(&topics_to_remove);
+        if !topics_to_remove.is_empty() {
+            self.remove_consumers(&topics_to_remove);
+        }
         if let Some(result) = result {
             return Poll::Ready(Some(result));
         }

@@ -9,8 +9,13 @@ use regex::Regex;
 
 use crate::{
     consumer::{
-        config::ConsumerConfig, data::DeadLetterPolicy, full_topic_name, multi,
-        multi::MultiTopicConsumer, options::ConsumerOptions, topic::TopicConsumer, InnerConsumer,
+        config::ConsumerConfig,
+        data::DeadLetterPolicy,
+        full_topic_name, multi,
+        multi::{MultiTopicConsumer, Woken},
+        options::ConsumerOptions,
+        topic::TopicConsumer,
+        InnerConsumer,
     },
     message::proto::command_subscribe::SubType,
     reader::Reader,
@@ -325,7 +330,6 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 .into_iter()
                 .map(|c| (c.topic(), Box::pin(c)))
                 .collect();
-            let existing_topics: VecDeque<String> = consumers.keys().cloned().collect();
             let topic_refresh = self
                 .topic_refresh
                 .unwrap_or_else(|| Duration::from_secs(30));
@@ -343,9 +347,9 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                     .unwrap_or_else(|| "public/default".to_string()),
                 topic_regex: self.topic_regex,
                 pulsar: self.pulsar,
+                woken: Woken::new(consumers.keys().cloned()),
                 consumers,
                 partitioned,
-                existing_topics,
                 subscribed,
                 ended: false,
                 new_consumers: None,
