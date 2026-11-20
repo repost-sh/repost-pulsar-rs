@@ -16,6 +16,7 @@ mod cluster;
 mod delivery;
 mod events;
 mod partitions;
+mod producer;
 mod reader;
 mod reconnect;
 mod seek;

@@ -453,18 +453,7 @@ impl<T: DeserializeMessage + 'static, Exe: Executor> Stream for Consumer<T, Exe>
     }
 }
 
-/// The fully qualified name Pulsar uses for `topic`, so that `orders`,
-/// `public/default/orders` and `persistent://public/default/orders` match.
-// Java: pulsar-common/.../naming/TopicName.java
-fn full_topic_name(topic: &str) -> String {
-    if topic.contains("://") {
-        return topic.to_string();
-    }
-    match topic.split('/').count() {
-        1 => format!("persistent://public/default/{topic}"),
-        _ => format!("persistent://{topic}"),
-    }
-}
+pub(crate) use crate::service_discovery::full_topic_name;
 
 #[cfg(test)]
 mod tests {

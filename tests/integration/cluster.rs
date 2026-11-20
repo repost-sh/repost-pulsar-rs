@@ -385,6 +385,27 @@ impl Cluster {
         .await;
     }
 
+    /// Publishes `message` with `key` through the Java client's command line,
+    /// inside a running broker's container, so it routes it by its default
+    /// rule.
+    pub async fn java_produce(&self, topic: &str, key: &str, message: &str) {
+        let broker = self.running().next().expect("a running broker");
+        docker(&[
+            "exec",
+            BROKERS[broker],
+            "bin/pulsar-client",
+            "--url",
+            &service_url(broker),
+            "produce",
+            topic,
+            "--key",
+            key,
+            "--messages",
+            message,
+        ])
+        .await;
+    }
+
     /// Creates [`STRICT_NAMESPACE`] if it is missing.
     pub async fn ensure_strict_namespace(&self) {
         let path = format!("admin/v2/namespaces/{STRICT_NAMESPACE}");

@@ -33,7 +33,8 @@ use crate::{
     },
     proto::CommandSuccess,
     retry_op::retry_create_producer,
-    routing_policy::RoutingPolicy,
+    routing_policy::{HashingScheme, RoutingPolicy},
+    service_discovery::{full_topic_name, partition_name},
     BrokerAddress, Error, Pulsar,
 };
 
@@ -172,9 +173,23 @@ pub struct ProducerOptions {
     /// [`Producer::send_non_blocking`]. (default: false)
     pub block_queue_if_full: bool,
     pub routing_policy: Option<RoutingPolicy>,
+    /// How often a producer of a partitioned topic looks for partitions added
+    /// to it (default 60 s).
+    ///
+    /// Each producer finds added partitions on its own schedule, so two
+    /// producers of one topic route a key to different partitions until both
+    /// found them. Java producers do the same.
+    // Java: ProducerConfigurationData.autoUpdatePartitionsIntervalSeconds
+    pub partition_refresh: Option<Duration>,
+    /// How a key picks its partition (default Java's string hash).
+    pub hashing_scheme: HashingScheme,
 }
 
 impl ProducerOptions {
+    fn partition_refresh(&self) -> Duration {
+        self.partition_refresh.unwrap_or(Duration::from_secs(60))
+    }
+
     fn enabled_batching(&self) -> bool {
         match self.batch_size {
             Some(batch_size) => batch_size > 1,
@@ -223,11 +238,11 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
     /// stops the producer
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn close_producer<S: Into<String>>(&mut self, topic: S) -> Result<(), Error> {
-        let partitions = self.client.lookup_partitioned_topic(topic).await?;
-        for (topic, _) in partitions {
-            self.producers.remove(&topic);
+        // producers are kept by the topic they were sent to, partitioned or not
+        match self.producers.remove(&full_topic_name(&topic.into())) {
+            Some(mut producer) => producer.close().await,
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// sends one message on a topic
@@ -252,7 +267,8 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
         message: T,
     ) -> Result<SendFuture, Error> {
         let message = T::serialize_message(message)?;
-        let topic = topic.into();
+        // kept by full name, so close_producer finds it under any spelling
+        let topic = full_topic_name(&topic.into());
         let producer = match self.producers.entry(topic) {
             Entry::Vacant(entry) => {
                 let mut builder = self
@@ -517,6 +533,9 @@ impl<Exe: Executor> Producer<Exe> {
         match &mut self.inner {
             ProducerInner::Single(producer) => producer.close().await,
             ProducerInner::Partitioned(p) => {
+                // a look under way closes what it finds
+                p.closed = true;
+                p.growing = None;
                 try_join_all(p.producers.iter_mut().map(|p| p.close()))
                     .await
                     .map(drop)
@@ -531,11 +550,21 @@ enum ProducerInner<Exe: Executor> {
 }
 
 struct PartitionedProducer<Exe: Executor> {
-    // Guaranteed to be non-empty
+    /// One per partition, in partition order. Guaranteed to be non-empty.
     producers: Vec<TopicProducer<Exe>>,
     last_used_producer_index: usize,
     topic: String,
+    name: Option<String>,
     options: ProducerOptions,
+    client: Pulsar<Exe>,
+    /// Where keyless messages start when batching, as in Java.
+    start_index: usize,
+    /// When to look for added partitions next.
+    next_refresh: Instant,
+    /// Producers for added partitions, created on the executor.
+    growing: Option<oneshot::Receiver<Vec<TopicProducer<Exe>>>>,
+    /// Closed: no more growth.
+    closed: bool,
 }
 
 impl<Exe: Executor> PartitionedProducer<Exe> {
@@ -551,34 +580,150 @@ impl<Exe: Executor> PartitionedProducer<Exe> {
             .unwrap()
     }
 
+    /// Takes on the producers of partitions added since the last look, and
+    /// starts the next look when it is due. Producers for added partitions
+    /// are created on the executor, so no send waits for them.
+    // Java: PartitionedProducerImpl.java TopicsPartitionChangedListener
+    fn grow(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Some(growing) = &mut self.growing {
+            match growing.try_recv() {
+                Ok(None) => return,
+                Ok(Some(added)) => self.producers.extend(added),
+                Err(_) => {}
+            }
+            self.growing = None;
+        }
+        if Instant::now() < self.next_refresh {
+            return;
+        }
+        self.next_refresh = Instant::now() + self.options.partition_refresh();
+        let (tx, rx) = oneshot::channel();
+        let (client, topic, name, options) = (
+            self.client.clone(),
+            self.topic.clone(),
+            self.name.clone(),
+            self.options.clone(),
+        );
+        let known = self.producers.len() as u32;
+        let executor = client.executor.clone();
+        // A look ends by itself after several operation timeouts, so a stuck
+        // one cannot hold up the next. Producers nobody takes, after a close,
+        // close as they drop.
+        let deadline = client
+            .operation_retry_options
+            .operation_timeout
+            .saturating_mul(4);
+        let looking = executor.clone().spawn(Box::pin(async move {
+            let look = Box::pin(added_producers(&client, &topic, known, name, options));
+            let added = match future::select(look, Box::pin(executor.delay(deadline))).await {
+                Either::Left((added, _)) => added,
+                Either::Right(_) => {
+                    warn!("gave up looking for added partitions of {topic}");
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(added);
+        }));
+        if looking.is_ok() {
+            self.growing = Some(rx);
+        }
+    }
+
+    /// The partition `message`'s key picks, if it has one.
+    fn keyed(&self, message: &Message) -> Option<usize> {
+        let key = message.partition_key.as_ref()?;
+        Some(
+            self.options
+                .hashing_scheme
+                .partition(key, self.producers.len()),
+        )
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn choose_partition(&mut self, message: &Message) -> &mut TopicProducer<Exe> {
+        self.grow();
         match &self.options.routing_policy {
-            Some(RoutingPolicy::RoundRobin) => {
-                // If the message has a partition key, use it
-                if let Some(partition_key) = &message.partition_key {
-                    let index = RoutingPolicy::compute_partition_index_for_key(
-                        partition_key,
-                        self.producers.len(),
-                    );
-                    return self.producers.get_mut(index).unwrap();
+            // Java: RoundRobinPartitionMessageRouterImpl, the default router
+            Some(RoutingPolicy::RoundRobin) | None => {
+                if let Some(index) = self.keyed(message) {
+                    return &mut self.producers[index];
                 }
-                // If not, use round robin
+                if self.options.enabled_batching() {
+                    // stay on a partition for ten batching delays, so that
+                    // batches fill up
+                    let delay = self
+                        .options
+                        .batch_timeout
+                        .unwrap_or(Duration::from_millis(1));
+                    let switch = delay.saturating_mul(10).as_millis().max(1);
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let index = ((now / switch + self.start_index as u128)
+                        % self.producers.len() as u128) as usize;
+                    return &mut self.producers[index];
+                }
                 self.get_next_round_robin_producer()
             }
-            Some(RoutingPolicy::Single) => self
-                .producers
-                .get_mut(self.last_used_producer_index)
-                .unwrap(),
+            // Java: SinglePartitionMessageRouterImpl hashes keyed messages too
+            Some(RoutingPolicy::Single) => {
+                let index = self.keyed(message).unwrap_or(self.start_index);
+                &mut self.producers[index]
+            }
             Some(RoutingPolicy::Custom(policy)) => {
                 let amount_of_producers = self.producers.len();
                 self.producers
                     .get_mut(policy.route(message, amount_of_producers))
                     .unwrap()
             }
-            None => self.get_next_round_robin_producer(),
         }
     }
+}
+
+/// Producers for the partitions of `topic` past `known`, in partition order.
+/// Routing needs every partition up to the last, so the first that fails ends
+/// what is kept; the next look tries it again.
+async fn added_producers<Exe: Executor>(
+    client: &Pulsar<Exe>,
+    topic: &str,
+    known: u32,
+    name: Option<String>,
+    options: ProducerOptions,
+) -> Vec<TopicProducer<Exe>> {
+    let count = match client.lookup_partitioned_topic_number(topic).await {
+        Ok(count) => count,
+        Err(e) => {
+            warn!("could not look for added partitions of {topic}: {e}");
+            return Vec::new();
+        }
+    };
+    let created = future::join_all((known..count).map(|index| {
+        let (client, name, options) = (client.clone(), name.clone(), options.clone());
+        let partition = partition_name(topic, index);
+        async move {
+            let addr = client.lookup_topic(partition.clone()).await?;
+            TopicProducer::new(client, addr, partition, name, options).await
+        }
+    }))
+    .await;
+    let mut added = Vec::new();
+    let mut failed = false;
+    for producer in created {
+        match producer {
+            Ok(producer) if !failed => added.push(producer),
+            // closes as it drops
+            Ok(_) => {}
+            Err(e) => {
+                warn!("could not create a producer for an added partition of {topic}: {e}");
+                failed = true;
+            }
+        }
+    }
+    added
 }
 
 /// a producer is used to publish messages on a topic
@@ -1362,40 +1507,39 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
         let topic = topic.ok_or_else(|| Error::Custom("topic not set".to_string()))?;
         let options = producer_options.unwrap_or_default();
 
-        let mut producers: Vec<TopicProducer<Exe>> = try_join_all(
-            pulsar
-                .lookup_partitioned_topic(&topic)
-                .await?
-                .into_iter()
-                .map(|(topic, addr)| {
-                    let name = name.clone();
-                    let options = options.clone();
-                    let pulsar = pulsar.clone();
-                    async move {
-                        let producer =
-                            TopicProducer::new(pulsar, addr, topic, name, options).await?;
-                        Ok::<TopicProducer<Exe>, Error>(producer)
-                    }
-                }),
-        )
-        .await?;
+        let (partitions, topics) = pulsar.lookup_partitions(&topic).await?;
+        // in lookup order, which is partition order and which routing needs
+        let producers: Vec<TopicProducer<Exe>> =
+            try_join_all(topics.into_iter().map(|(topic, addr)| {
+                TopicProducer::new(pulsar.clone(), addr, topic, name.clone(), options.clone())
+            }))
+            .await?;
 
-        // sort by partition id
-        producers.sort_by_key(|prod| prod.id);
-
-        let producer = match producers.len() {
-            0 => {
-                return Err(Error::Custom(format!(
-                    "Unexpected error: Partition lookup returned no topics for {topic}"
-                )));
+        // A partitioned topic gets a partitioned producer even with one
+        // partition, so that it can grow.
+        let producer = if partitions == 0 {
+            match producers.into_iter().next() {
+                Some(producer) => ProducerInner::Single(producer),
+                None => {
+                    return Err(Error::Custom(format!(
+                        "Unexpected error: Partition lookup returned no topics for {topic}"
+                    )))
+                }
             }
-            1 => ProducerInner::Single(producers.into_iter().next().unwrap()),
-            len => ProducerInner::Partitioned(PartitionedProducer {
+        } else {
+            let start_index = rand::thread_rng().gen_range(0..producers.len());
+            ProducerInner::Partitioned(PartitionedProducer {
+                last_used_producer_index: start_index,
+                start_index,
                 producers,
-                last_used_producer_index: rand::thread_rng().gen_range(0..len),
                 topic,
+                name,
+                next_refresh: Instant::now() + options.partition_refresh(),
                 options,
-            }),
+                client: pulsar,
+                growing: None,
+                closed: false,
+            })
         };
 
         Ok(Producer { inner: producer })

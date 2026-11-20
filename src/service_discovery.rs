@@ -320,6 +320,19 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
     }
 }
 
+/// The fully qualified name Pulsar uses for `topic`, so that `orders`,
+/// `public/default/orders` and `persistent://public/default/orders` match.
+// Java: pulsar-common/.../naming/TopicName.java
+pub(crate) fn full_topic_name(topic: &str) -> String {
+    if topic.contains("://") {
+        return topic.to_string();
+    }
+    match topic.split('/').count() {
+        1 => format!("persistent://public/default/{topic}"),
+        _ => format!("persistent://{topic}"),
+    }
+}
+
 /// The name of partition `index` of `topic`.
 pub(crate) fn partition_name(topic: &str, index: u32) -> String {
     format!("{topic}-partition-{index}")
