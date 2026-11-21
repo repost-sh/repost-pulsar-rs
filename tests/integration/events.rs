@@ -155,6 +155,48 @@ async fn a_seek_keeps_ownership_the_broker_keeps() {
     assert_eq!(events(&seen, &first), Vec::<bool>::new(), "{seen:?}");
 }
 
+// With a second consumer waiting, the broker holds the partition back for a
+// second when its owner leaves, which the seek's reconnect fits in.
+#[tokio::test]
+async fn an_inclusive_seek_keeps_the_partition_from_a_waiting_consumer() {
+    let cluster = exclusive().await;
+    let topic = topic("events-seek-at");
+    cluster.create_partitioned_topic(&topic, 2).await;
+    let (first, second) = (partition(&topic, 0), partition(&topic, 1));
+    let pulsar = cluster.client().await;
+    let mut a = failover_consumer(&pulsar, &topic, "a").await;
+    gather(&mut a, |s| {
+        events(s, &first) == [true] && events(s, &second) == [true]
+    })
+    .await;
+    publish(&pulsar, &first, 1..=3).await;
+    let taken = take(&mut a, &mut Delivered::default(), 3).await;
+    // The broker sorts consumers by name: b gets partition 1 and waits for 0.
+    let mut b = failover_consumer(&pulsar, &topic, "b").await;
+    tokio::join!(
+        gather(&mut b, |s| events(s, &second) == [true]),
+        gather(&mut a, |s| events(s, &second) == [false]),
+    );
+
+    a.seek_to_inclusive(&first, taken[1].message_id().clone())
+        .await
+        .expect("seek");
+
+    // The seek answers once a is back, so whatever its absence made the
+    // broker tell b is on its way by then.
+    let (seen, seen_by_b) = tokio::join!(
+        gather(&mut a, |s| messages(s, &first).last() == Some(&3)),
+        gather(&mut b, |_| true),
+    );
+    assert_eq!(messages(&seen, &first), [2, 3], "{seen:?}");
+    assert_eq!(events(&seen, &first), Vec::<bool>::new(), "{seen:?}");
+    assert_eq!(
+        (events(&seen_by_b, &first), messages(&seen_by_b, &first)),
+        (vec![], vec![]),
+        "b: {seen_by_b:?}"
+    );
+}
+
 // A consumer that seeks whenever it gets a partition, as an indexer seeking
 // to its checkpoint does, must not hear of the partition again for its own
 // seek, or it seeks for ever.

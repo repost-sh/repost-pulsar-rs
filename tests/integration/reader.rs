@@ -8,7 +8,8 @@ use pulsar::{proto::MessageIdData, reader::Reader, ConsumerOptions, Pulsar, Toki
 use crate::{
     cluster::{exclusive, partition, topic},
     delivery::{
-        collect, earliest_reader, publish, publish_batched, reader_with, take, Delivered, DEADLINE,
+        available, collect, earliest_reader, publish, publish_batched, reader_with, take,
+        Delivered, DEADLINE,
     },
 };
 
@@ -250,13 +251,6 @@ async fn a_reader_starts_after_or_at_a_member_of_a_batch() {
     assert!(ids[3].batch_index.is_some(), "the producer did not batch");
 
     assert_reads_from(&pulsar, &topic, &ids[3], 5..=10, 4..=10).await;
-}
-
-async fn available(reader: &mut Reader<String, TokioExecutor>) -> bool {
-    tokio::time::timeout(DEADLINE, reader.has_message_available())
-        .await
-        .expect("an answer within the deadline")
-        .expect("has_message_available")
 }
 
 #[tokio::test]

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Consumer
+
+- `Consumer::seek_to_inclusive(topic, id)` and `Reader::seek_to_inclusive`
+  restart a topic or partition at `id`, where `seek_to` restarts after it.
+  The next message is `id` itself, and the members of its batch before it
+  are not delivered. The seek holds under failures as `seek_to` does. When
+  the broker no longer holds `id`, because its ledger was deleted, the seek
+  succeeds and the next message is the first one the topic holds after
+  `id`, or nothing arrives until the next publish. On a durable
+  subscription, a reconnect after `id` has arrived and before its batch is
+  acked delivers the unacked members of that batch again, the ones before
+  `id` included.
+
 ## 7.0.0
 
 This fork of pulsar-rs brings the consumer and producer machinery that a

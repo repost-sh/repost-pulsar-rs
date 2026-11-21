@@ -25,4 +25,5 @@ mod reconnect;
 mod retries;
 mod scale;
 mod seek;
+mod seek_inclusive;
 mod smoke;

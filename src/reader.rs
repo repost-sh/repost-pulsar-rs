@@ -128,6 +128,17 @@ impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
         self.consumer.seek_to(topic, message_id).await
     }
 
+    /// Restarts one topic or partition at `message_id`, which is read next,
+    /// as [`Consumer::seek_to_inclusive`] does.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn seek_to_inclusive(
+        &mut self,
+        topic: &str,
+        message_id: MessageIdData,
+    ) -> Result<(), Error> {
+        self.consumer.seek_to_inclusive(topic, message_id).await
+    }
+
     /// Restarts every partition at the first message published at or after
     /// `publish_time_ms`, as [`Consumer::seek_to_time`] does.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]

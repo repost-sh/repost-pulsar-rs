@@ -329,6 +329,20 @@ pub struct ConsumerStats {
     pub connected_since: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalStats {
+    ledgers: Vec<Ledger>,
+}
+
+/// A ledger of a topic, as the broker lists it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ledger {
+    pub ledger_id: u64,
+    /// Zero while the ledger is the one written to.
+    pub entries: u64,
+}
+
 impl Cluster {
     /// A client bootstrapped through a broker that is up.
     pub async fn client(&self) -> Pulsar<TokioExecutor> {
@@ -508,6 +522,50 @@ impl Cluster {
             None,
         )
         .await;
+    }
+
+    /// The ledgers `topic` still has, oldest first.
+    pub async fn ledgers(&self, topic: &str) -> Vec<Ledger> {
+        let stats: InternalStats = self
+            .admin(
+                reqwest::Method::GET,
+                &format!("{}/internalStats", path(topic)),
+                None,
+            )
+            .await
+            .json()
+            .await
+            .expect("internal stats");
+        stats.ledgers
+    }
+
+    /// Has the broker delete now the ledgers of `topic` that no subscription
+    /// and no retention holds, which it otherwise does on its own schedule.
+    async fn trim(&self, topic: &str) {
+        self.admin(
+            reqwest::Method::POST,
+            &format!("{}/trim", path(topic)),
+            None,
+        )
+        .await;
+    }
+
+    /// Trims `topic` until the broker has deleted `ledger_id`.
+    pub async fn wait_ledger_gone(&self, topic: &str, ledger_id: u64) {
+        let last = std::cell::RefCell::new(Vec::new());
+        let gone = eventually(FAILOVER_TIMEOUT, || async {
+            self.trim(topic).await;
+            let ledgers = self.ledgers(topic).await;
+            let gone = ledgers.iter().all(|ledger| ledger.ledger_id != ledger_id);
+            *last.borrow_mut() = ledgers;
+            gone
+        })
+        .await;
+        assert!(
+            gone,
+            "ledger {ledger_id} of {topic} still there after {FAILOVER_TIMEOUT:?}: {:?}",
+            last.borrow()
+        );
     }
 
     /// Index of the broker that owns `topic`, assigning an owner if none has it.

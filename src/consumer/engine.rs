@@ -756,12 +756,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 taken.clear();
             }
             // Java: ConsumerImpl.java:3070, after a seek the target becomes
-            // the exclusive start; after a seek by time nothing is filtered.
-            let seek = delivery.pending_seek.take();
-            match &seek {
-                Some(Seek::Id(target)) => self.start = Some(target.clone()),
-                Some(Seek::Time(_)) => self.start = None,
-                None => {}
+            // the start; after a seek by time nothing is filtered.
+            if let Some(seek) = delivery.pending_seek.take() {
+                self.start = start_filter(&seek.resume());
             }
             let mut options = self.options.clone();
             let rollback = if self.options.durable == Some(false) {
@@ -1129,11 +1126,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// time, leaves the subscription where it was.
     // Java: ConsumerImpl.java:3043 seekAsyncInternal
     async fn seek(&mut self, seek: Seek, started: Instant) -> Result<Result<(), Error>, Error> {
-        let (message_id, timestamp, resume) = match &seek {
-            Seek::Id(target) => (Some(target.clone()), None, Resume::After(target.clone())),
-            Seek::Time(publish_time_ms) => {
-                (None, Some(*publish_time_ms), Resume::Time(*publish_time_ms))
-            }
+        let resume = seek.resume();
+        let (message_id, timestamp) = match &seek {
+            Seek::At(target) | Seek::After(target) => (Some(target.clone()), None),
+            Seek::Time(publish_time_ms) => (None, Some(*publish_time_ms)),
         };
         // it waited for a reconnect that took all its time
         if started.elapsed() >= self.client.operation_retry_options.operation_timeout {

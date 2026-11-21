@@ -20,6 +20,7 @@ use std::{
 pub use builder::ConsumerBuilder;
 use chrono::{DateTime, Utc};
 pub use data::DeadLetterPolicy;
+use data::Seek;
 use futures::{
     future::try_join_all,
     task::{Context, Poll},
@@ -200,17 +201,54 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     // partition that owns the id
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn seek_to(&mut self, topic: &str, message_id: MessageIdData) -> Result<(), Error> {
+        self.topic_consumer(topic)?
+            .seek(Some(message_id), None)
+            .await
+    }
+
+    /// Restarts `topic` at `message_id`: the next message from that topic or
+    /// partition is `message_id` itself. When `message_id` is a member of a
+    /// batch, this seek does not deliver the members before it. In everything
+    /// else this is [`Consumer::seek_to`], which says how to name `topic`.
+    ///
+    /// When the broker no longer holds `message_id`, because its ledger was
+    /// deleted, the seek still succeeds. The next message is then the first
+    /// one the topic holds after `message_id`, and if the topic holds none,
+    /// nothing arrives until the next publish. Compare the id of the next
+    /// message with `message_id` to learn whether the topic still holds it.
+    /// Silence proves neither.
+    ///
+    /// On a durable subscription, a reconnect after `message_id` has arrived
+    /// and before its batch is acked delivers the unacked members of that
+    /// batch again, the ones before `message_id` included. A caller that
+    /// tracks its position must skip them.
+    ///
+    /// Like [`Consumer::seek_to`], the seek happens once called even if the
+    /// future is dropped, runs after the seeks called before it, waits for a
+    /// reconnect in progress within the operation timeout, and leaves the
+    /// subscription where it was when the broker refuses it.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn seek_to_inclusive(
+        &mut self,
+        topic: &str,
+        message_id: MessageIdData,
+    ) -> Result<(), Error> {
+        self.topic_consumer(topic)?
+            .send_seek(Seek::At(message_id))
+            .await
+    }
+
+    /// The consumer of `topic`, named as [`Consumer::seek_to`] takes it.
+    fn topic_consumer(&mut self, topic: &str) -> Result<&mut TopicConsumer<T, Exe>, Error> {
         let topic = full_topic_name(topic);
-        let consumer = self
-            .topic_consumers()
+        self.topic_consumers()
             .into_iter()
             .find(|c| full_topic_name(&c.topic()) == topic)
             .ok_or_else(|| {
                 Error::Connection(ConnectionError::Unexpected(format!(
                     "no consumer for topic {topic}"
                 )))
-            })?;
-        consumer.seek(Some(message_id), None).await
+            })
     }
 
     /// Restarts every topic and partition at the first message published at or

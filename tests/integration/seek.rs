@@ -8,7 +8,7 @@ use pulsar::ConsumerOptions;
 use crate::{
     cluster::{exclusive, partition, topic},
     delivery::{
-        collect, earliest_consumer, earliest_consumer_with, earliest_reader, number, publish,
+        collect, earliest_consumer, earliest_consumer_with, earliest_reader, next, number, publish,
         publish_around_a_time, take, Delivered, DEADLINE,
     },
 };
@@ -34,7 +34,7 @@ async fn seeking_one_partition_leaves_the_other_alone() {
 
     let mut all = Delivered::default();
     let fifth = loop {
-        let message = take(&mut consumer, &mut all, 1).await.remove(0);
+        let message = next(&mut consumer, &mut all).await;
         if message.topic == first && message.deserialize().unwrap() == "5" {
             break message.message_id().clone();
         }
@@ -51,11 +51,7 @@ async fn seeking_one_partition_leaves_the_other_alone() {
     // nothing happened.
     let mut after = Delivered::default();
     while after.distinct() < 17 || all.distinct_on(&second) < 12 {
-        let message =
-            tokio::time::timeout(DEADLINE, take(&mut consumer, &mut Delivered::default(), 1))
-                .await
-                .expect("message within the deadline")
-                .remove(0);
+        let message = next(&mut consumer, &mut Delivered::default()).await;
         if message.topic == first {
             after.record(&message);
         } else {

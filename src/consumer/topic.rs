@@ -232,7 +232,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         timestamp: Option<u64>,
     ) -> Result<(), Error> {
         let seek = match (message_id, timestamp) {
-            (Some(target), _) => Seek::Id(target),
+            (Some(target), _) => Seek::After(target),
             (None, Some(publish_time_ms)) => Seek::Time(publish_time_ms),
             (None, None) => {
                 return Err(Error::Custom(
@@ -240,6 +240,10 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 ))
             }
         };
+        self.send_seek(seek).await
+    }
+
+    pub(crate) async fn send_seek(&mut self, seek: Seek) -> Result<(), Error> {
         // The engine makes the seek and sees it through: one dropped here
         // still happens, or fails as a whole.
         let (reply, answer) = oneshot::channel();

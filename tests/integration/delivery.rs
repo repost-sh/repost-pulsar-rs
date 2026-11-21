@@ -281,6 +281,27 @@ where
     messages
 }
 
+/// Takes the next message, as [`take`] does, and fails unless it arrives
+/// within [`DEADLINE`].
+pub async fn next<S>(stream: &mut S, delivered: &mut Delivered) -> Message<String>
+where
+    S: Stream<Item = Result<Message<String>, Error>> + Unpin,
+{
+    tokio::time::timeout(DEADLINE, take(stream, delivered, 1))
+        .await
+        .expect("a message within the deadline")
+        .remove(0)
+}
+
+/// Whether `reader` has a message left to read, answered within
+/// [`DEADLINE`].
+pub async fn available(reader: &mut Reader<String, TokioExecutor>) -> bool {
+    tokio::time::timeout(DEADLINE, reader.has_message_available())
+        .await
+        .expect("an answer within the deadline")
+        .expect("has_message_available")
+}
+
 /// Reads until `distinct` different messages have arrived and then nothing
 /// more for three seconds, so a duplicate that arrives late is still recorded.
 /// Gives up after `deadline`, or when the stream ends or fails.

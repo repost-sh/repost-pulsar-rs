@@ -7,7 +7,7 @@ use pulsar::{consumer::InitialPosition, Consumer, ConsumerOptions, SubType, Toki
 
 use crate::{
     cluster::{exclusive, topic},
-    delivery::{earliest_consumer_with, publish, take, Delivered},
+    delivery::{earliest_consumer_with, next, publish, take, Delivered},
 };
 
 #[tokio::test]
@@ -62,7 +62,7 @@ async fn messages_the_application_has_not_read_are_not_redelivered() {
     // has it, but most wait longer than that before it gets to them.
     let mut delivered = Delivered::default();
     for _ in 1..=30 {
-        let message = take(&mut consumer, &mut delivered, 1).await.remove(0);
+        let message = next(&mut consumer, &mut delivered).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         consumer.ack(&message).await.expect("ack");
     }

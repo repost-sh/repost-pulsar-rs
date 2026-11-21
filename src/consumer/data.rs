@@ -45,7 +45,8 @@ pub(crate) enum Resume {
     /// start a new subscription at the configured start. Java starts from the
     /// earliest message instead (ConsumerImpl.java:3125), replaying the topic.
     Time(u64),
-    /// The first message queued while the application had taken none.
+    /// The first message queued while the application had taken none, or
+    /// the target of an inclusive seek.
     From(MessageIdData),
     /// After the last message the application took, or a seek's target.
     After(MessageIdData),
@@ -54,10 +55,24 @@ pub(crate) enum Resume {
 /// Where a seek moves a consumer.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Seek {
+    /// To this message, which is delivered next.
+    At(MessageIdData),
     /// After this message.
-    Id(MessageIdData),
+    After(MessageIdData),
     /// To the first message published at or after this time, in milliseconds.
     Time(u64),
+}
+
+impl Seek {
+    /// Where delivery resumes once the broker has moved, which also says
+    /// what to drop of the entry the broker sends first.
+    pub fn resume(&self) -> Resume {
+        match self {
+            Seek::At(target) => Resume::From(target.clone()),
+            Seek::After(target) => Resume::After(target.clone()),
+            Seek::Time(publish_time_ms) => Resume::Time(*publish_time_ms),
+        }
+    }
 }
 
 /// What the application has taken from one topic consumer, shared between the
