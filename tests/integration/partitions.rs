@@ -11,7 +11,7 @@ use pulsar::{
 
 use crate::{
     cluster::{exclusive, partition, topic, topic_in, Cluster, STRICT_NAMESPACE},
-    delivery::{collect, earliest_reader, publish, take, Delivered, DEADLINE},
+    delivery::{collect, earliest_consumer, earliest_reader, publish, take, Delivered, DEADLINE},
 };
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -200,4 +200,28 @@ async fn a_regex_consumer_reports_a_namespace_it_cannot_list() {
         .build::<String>()
         .await;
     assert!(result.is_err(), "built a consumer of a missing namespace");
+}
+
+// Acks name a partition the way seek_to does: by the name the application
+// built the consumer with, or by its full name.
+#[tokio::test]
+async fn a_partition_is_found_by_its_short_or_full_name() {
+    let cluster = exclusive().await;
+    let full = topic("partitions-names");
+    let short = full.trim_start_matches("persistent://public/default/");
+    cluster.create_partitioned_topic(&full, 2).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &partition(&full, 1), 1..=1).await;
+    let mut consumer = earliest_consumer(&pulsar, short, "names").await;
+    let message = take(&mut consumer, &mut Delivered::default(), 1)
+        .await
+        .remove(0);
+
+    consumer
+        .ack_with_id(&partition(&full, 1), message.message_id().clone())
+        .await
+        .expect("ack by the full name");
+    cluster
+        .wait_subscription(&partition(&full, 1), "names", |s| s.msg_backlog == 0)
+        .await;
 }

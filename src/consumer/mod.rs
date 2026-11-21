@@ -19,7 +19,7 @@ use std::{
 
 pub use builder::ConsumerBuilder;
 use chrono::{DateTime, Utc};
-pub use data::{DeadLetterPolicy, EngineMessage};
+pub use data::DeadLetterPolicy;
 use futures::{
     future::try_join_all,
     task::{Context, Poll},

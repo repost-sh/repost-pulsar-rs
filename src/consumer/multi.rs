@@ -191,6 +191,19 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         Ok(())
     }
 
+    /// The consumer of `topic`, named as the application built it or by its
+    /// full name, as `Consumer::seek_to` accepts.
+    fn consumer_mut(&mut self, topic: &str) -> Option<&mut Pin<Box<TopicConsumer<T, Exe>>>> {
+        if self.consumers.contains_key(topic) {
+            return self.consumers.get_mut(topic);
+        }
+        let full = full_topic_name(topic);
+        self.consumers
+            .iter_mut()
+            .find(|(name, _)| full_topic_name(name) == full)
+            .map(|(_, consumer)| consumer)
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub(super) fn add_refreshed(&mut self, refreshed: Refreshed<T, Exe>) {
         for consumer in refreshed.consumers {
@@ -309,7 +322,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         topic: &str,
         msg_id: MessageIdData,
     ) -> Result<(), ConsumerError> {
-        if let Some(c) = self.consumers.get_mut(topic) {
+        if let Some(c) = self.consumer_mut(topic) {
             c.ack_with_id(msg_id).await
         } else {
             Err(ConnectionError::Unexpected(format!("no consumer for topic {topic}")).into())
@@ -331,7 +344,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         topic: &str,
         msg_id: MessageIdData,
     ) -> Result<(), ConsumerError> {
-        if let Some(c) = self.consumers.get_mut(topic) {
+        if let Some(c) = self.consumer_mut(topic) {
             c.cumulative_ack_with_id(msg_id).await
         } else {
             Err(ConnectionError::Unexpected(format!("no consumer for topic {topic}")).into())
@@ -354,7 +367,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         topic: &str,
         msg_id: MessageIdData,
     ) -> Result<(), ConsumerError> {
-        if let Some(c) = self.consumers.get_mut(topic) {
+        if let Some(c) = self.consumer_mut(topic) {
             c.nack_with_id(msg_id).await?;
             Ok(())
         } else {
@@ -368,7 +381,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
         topic: &str,
         version: Option<Vec<u8>>,
     ) -> Result<Option<Schema>, Error> {
-        if let Some(c) = self.consumers.get_mut(topic) {
+        if let Some(c) = self.consumer_mut(topic) {
             c.get_schema(version).await
         } else {
             Err(ConnectionError::Unexpected(format!("no consumer for topic {topic}")).into())

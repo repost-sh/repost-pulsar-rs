@@ -523,7 +523,7 @@ impl Cluster {
         topic: &str,
         subscription: &str,
         holds: impl Fn(&SubscriptionStats) -> bool,
-    ) {
+    ) -> SubscriptionStats {
         let last = std::cell::RefCell::new(SubscriptionStats::default());
         let held = eventually(FAILOVER_TIMEOUT, || async {
             let mut stats: TopicStats = self
@@ -547,6 +547,7 @@ impl Cluster {
             "{subscription} on {topic} never reached the state: {:?}",
             last.borrow()
         );
+        last.into_inner()
     }
 
     /// Stops a broker the way a crash does: no graceful unload of its topics.

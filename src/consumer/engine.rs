@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,10 +15,11 @@ use crate::{
         batched_message_iterator::BatchedMessageIterator,
         data::{
             position, DeadLetterPolicy, Delivery, EngineEvent, EngineMessage, Queued, Resume, Seek,
+            SeekReply,
         },
         options::ConsumerOptions,
     },
-    error::{self, ConsumerError},
+    error::{self, ConnectionError, ConsumerError},
     message::{
         proto::{command_subscribe::SubType, MessageIdData},
         Message as RawMessage,
@@ -54,6 +55,9 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// When the first subscribe succeeded, which the configured rollback
     /// counts from.
     subscribed_at: Instant,
+    /// Seeks that came while the consumer was reconnecting, to make once it
+    /// is back.
+    deferred_seeks: VecDeque<(Seek, Instant, SeekReply)>,
     /// Whether `Delivery::resume` is past waiting for the first queued message
     /// on this connection, which spares a lock per message.
     first_queued_known: bool,
@@ -115,6 +119,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             epoch: 0,
             start,
             subscribed_at: Instant::now(),
+            deferred_seeks: VecDeque::new(),
             first_queued_known,
             engine_rx: Some(engine_rx),
             event_rx,
@@ -181,6 +186,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     })?;
             }
 
+            if let Some((seek, started, reply)) = self.deferred_seeks.pop_front() {
+                if !self.answer_seek(seek, started, reply).await {
+                    return Ok(());
+                }
+                continue;
+            }
+
             if let Some(engine_rx) = self.engine_rx.take() {
                 self.register_source(engine_rx, |msg| EngineEvent::EngineMessage(msg))
                     .map_err(|_| {
@@ -206,8 +218,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         return Ok(());
                     }
                 }
-                // only wakes the loop, whose top checks the connection
+                // wakes the loop, whose top checks the connection
                 Some(EngineEvent::Tick) => {}
+                Some(EngineEvent::RedeliveryTick) => self.redeliver_unacked().await,
                 None => {
                     log::warn!("Event stream is terminated");
                     return Ok(());
@@ -274,35 +287,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 }
                 true
             }
-            Some(EngineMessage::UnackedRedelivery) => {
-                self.track_taken();
-                let mut h = HashSet::new();
-                let now = Instant::now();
-                // info!("unacked messages length: {}", self.unacked_messages.len());
-                for (id, t) in self.unacked_messages.iter() {
-                    if *t < now {
-                        h.insert(id.clone());
-                    }
-                }
-
-                let ids: Vec<_> = h.iter().cloned().collect();
-                if !ids.is_empty() {
-                    // info!("will unack ids: {:?}", ids);
-                    if let Err(e) = self
-                        .connection
-                        .sender()
-                        .send_redeliver_unacknowleged_messages(self.id, ids)
-                        .await
-                    {
-                        error!("could not ask for redelivery: {:?}", e);
-                    } else {
-                        for i in h.iter() {
-                            self.unacked_messages.remove(i);
-                        }
-                    }
-                }
-                true
-            }
             Some(EngineMessage::Flow(epoch, permits)) => {
                 // a flow for an earlier connection is moot: the new
                 // subscription got a fresh window
@@ -311,9 +295,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 }
                 true
             }
-            Some(EngineMessage::CancelSeek(target)) => {
-                self.cancel_seek(&target);
-                true
+            Some(EngineMessage::Seek(seek, started, reply)) => {
+                self.answer_seek(seek, started, reply).await
             }
             Some(EngineMessage::GetConnection(sender)) => {
                 let _ = sender.send(self.connection.clone()).map_err(|_| {
@@ -732,7 +715,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             let mut delivery = self.delivery.lock().unwrap();
             delivery.epoch += 1;
             self.epoch = delivery.epoch;
-            delivery.freed = 0;
+            delivery.reconnecting();
             if let Some(taken) = &mut delivery.taken {
                 taken.clear();
             }
@@ -811,14 +794,17 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 Ok(messages) => {
                     // Acks sent while disconnected go out before the permits,
                     // so the broker does not dispatch those messages again.
-                    self.take_queued_acks(&mut acks);
+                    let closed = self.take_queued_acks(&mut acks);
                     for (message_id, cumulative) in std::mem::take(&mut acks) {
                         self.ack(message_id, cumulative).await;
                     }
-                    // what stale messages still queued leave of the window
-                    let free = self
-                        .window
-                        .saturating_sub(self.delivery.lock().unwrap().queued);
+                    if closed {
+                        return Err(Error::Consumer(ConsumerError::Closed));
+                    }
+                    let free = {
+                        let mut delivery = self.delivery.lock().unwrap();
+                        delivery.grant(self.window)
+                    };
                     let flow = if free > 0 {
                         send_initial_flow(&self.connection, &self.topic, self.id, free).await
                     } else {
@@ -830,6 +816,14 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                             return Ok(());
                         }
                         Err(e) => {
+                            // A new epoch: flows the application sent for this
+                            // grant are moot, and the next attempt grants anew.
+                            {
+                                let mut delivery = self.delivery.lock().unwrap();
+                                delivery.epoch += 1;
+                                self.epoch = delivery.epoch;
+                                delivery.reconnecting();
+                            }
                             let delay = self
                                 .client
                                 .manager
@@ -909,9 +903,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     }
 
     /// Waits out `delay` between reconnect attempts while still answering the
-    /// consumer: acks are kept for the new connection, and a connection request
-    /// gets the old one, so a close or seek fails fast instead of hanging.
-    /// Returns false once the application has dropped the consumer.
+    /// consumer: acks are kept for the new connection, a connection request
+    /// gets the old one, so a close fails fast instead of hanging, and a seek
+    /// waits for the reconnect. Returns false once the application has
+    /// dropped the consumer.
     async fn wait_disconnected(
         &mut self,
         delay: Duration,
@@ -919,8 +914,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     ) -> bool {
         let mut timer = Box::pin(self.client.executor.delay(delay));
         loop {
-            // The redelivery ticker keeps the engine channel open after the
-            // consumer is dropped, so the message channel tells instead.
+            // the application dropped the consumer
             if self.tx.is_closed() {
                 return false;
             }
@@ -935,14 +929,20 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 Some(EngineEvent::EngineMessage(Some(EngineMessage::GetConnection(sender)))) => {
                     let _ = sender.send(self.connection.clone());
                 }
-                Some(EngineEvent::EngineMessage(Some(EngineMessage::CancelSeek(target)))) => {
-                    self.cancel_seek(&target);
+                Some(EngineEvent::EngineMessage(Some(EngineMessage::Seek(
+                    seek,
+                    started,
+                    reply,
+                )))) => {
+                    self.deferred_seeks.push_back((seek, started, reply));
                 }
                 // the broker redelivers what is unacked once the consumer is
                 // back, and the new subscription gets a fresh window
                 Some(EngineEvent::EngineMessage(Some(_))) => {}
                 // frames from the old connection, and ticks
-                Some(EngineEvent::Message(..) | EngineEvent::Tick) => {}
+                Some(
+                    EngineEvent::Message(..) | EngineEvent::Tick | EngineEvent::RedeliveryTick,
+                ) => {}
                 Some(EngineEvent::EngineMessage(None)) | None => return false,
             }
         }
@@ -950,7 +950,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
     /// Takes acks already queued behind the reconnect and answers connection
     /// requests, without waiting for more.
-    fn take_queued_acks(&mut self, acks: &mut Vec<(MessageIdData, bool)>) {
+    /// Returns true if the application dropped the consumer meanwhile.
+    fn take_queued_acks(&mut self, acks: &mut Vec<(MessageIdData, bool)>) -> bool {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 EngineEvent::EngineMessage(Some(EngineMessage::Ack(id, cumulative))) => {
@@ -959,14 +960,17 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 EngineEvent::EngineMessage(Some(EngineMessage::GetConnection(sender))) => {
                     let _ = sender.send(self.connection.clone());
                 }
-                EngineEvent::EngineMessage(Some(EngineMessage::CancelSeek(target))) => {
-                    self.cancel_seek(&target);
+                EngineEvent::EngineMessage(Some(EngineMessage::Seek(seek, started, reply))) => {
+                    self.deferred_seeks.push_back((seek, started, reply));
                 }
-                // old frames, and nacks, redelivery ticks and flows the new
-                // subscription makes moot
+                // the application dropped the consumer
+                EngineEvent::EngineMessage(None) => return true,
+                // old frames, and nacks, ticks and flows the new subscription
+                // makes moot
                 _ => {}
             }
         }
+        false
     }
 
     /// Gives back the permit of a message the application never gets, so the
@@ -988,25 +992,184 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
-    fn cancel_seek(&mut self, target: &MessageIdData) {
-        if self.start.as_ref() == Some(target) {
-            self.start = None;
+    fn start_ticker(&mut self) -> Result<(), Error> {
+        self.tick_every(Duration::from_secs(1), || EngineEvent::Tick)?;
+        // Through the engine's own events, so the engine channel still closes
+        // when the application drops the consumer.
+        if let Some(delay) = self.unacked_message_redelivery_delay {
+            self.tick_every(delay.min(Duration::from_millis(500)), || {
+                EngineEvent::RedeliveryTick
+            })?;
         }
+        Ok(())
     }
 
-    fn start_ticker(&mut self) -> Result<(), Error> {
+    /// Sends the engine `event` every `period`, until the engine is gone.
+    fn tick_every(
+        &mut self,
+        period: Duration,
+        event: impl Fn() -> EngineEvent<Exe> + Send + 'static,
+    ) -> Result<(), Error> {
         let mut tick_tx = self.event_tx.clone();
-        let mut interval = self.client.executor.interval(Duration::from_secs(1));
+        let mut interval = self.client.executor.interval(period);
         self.client
             .executor
             .spawn(Box::pin(async move {
                 while interval.next().await.is_some() {
-                    if tick_tx.send(EngineEvent::Tick).await.is_err() {
+                    if tick_tx.send(event()).await.is_err() {
                         break;
                     }
                 }
             }))
             .map_err(|_| Error::Executor)
+    }
+
+    /// Asks the broker to send again what the application took and has not
+    /// acked within the redelivery delay.
+    async fn redeliver_unacked(&mut self) {
+        self.track_taken();
+        let now = Instant::now();
+        let ids: Vec<_> = self
+            .unacked_messages
+            .iter()
+            .filter(|(_, due)| **due < now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        match self
+            .connection
+            .sender()
+            .send_redeliver_unacknowleged_messages(self.id, ids.clone())
+            .await
+        {
+            Ok(_) => {
+                for id in &ids {
+                    self.unacked_messages.remove(id);
+                }
+            }
+            Err(e) => error!("could not ask for redelivery: {:?}", e),
+        }
+    }
+
+    /// Moves the subscription for a seek and answers the application, which
+    /// may have stopped waiting: a seek is seen through either way. False if
+    /// the consumer cannot go on.
+    async fn answer_seek(&mut self, seek: Seek, started: Instant, reply: SeekReply) -> bool {
+        match self.seek(seek, started).await {
+            Ok(result) => {
+                let _ = reply.send(result);
+                true
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                false
+            }
+        }
+    }
+
+    /// Moves the subscription to `seek`, made at `started`. The outer error
+    /// ends the consumer; the inner one is the seek's.
+    ///
+    /// The broker closes the consumer before it confirms, and the subscription
+    /// starts again at the target. A request lost with its connection, or
+    /// that found the broker not ready, goes again once the consumer is back,
+    /// within the operation timeout; for a reader, subscribing again at the
+    /// target is the seek. A seek the broker refuses, or that runs out of
+    /// time, leaves the subscription where it was.
+    // Java: ConsumerImpl.java:3043 seekAsyncInternal
+    async fn seek(&mut self, seek: Seek, started: Instant) -> Result<Result<(), Error>, Error> {
+        let (message_id, timestamp, resume) = match &seek {
+            Seek::Id(target) => (Some(target.clone()), None, Resume::After(target.clone())),
+            Seek::Time(publish_time_ms) => {
+                (None, Some(*publish_time_ms), Resume::Time(*publish_time_ms))
+            }
+        };
+        // it waited for a reconnect that took all its time
+        if started.elapsed() >= self.client.operation_retry_options.operation_timeout {
+            return Ok(Err(seek_timed_out()));
+        }
+        let max_backoff = self.client.manager.connection_retry_options().max_backoff;
+        let mut before = None;
+        let mut attempt = 0;
+        loop {
+            let stale = {
+                // What is buffered from before the seek must not reach the
+                // application, as Java clears its queue first.
+                // Java: MultiTopicsConsumerImpl.java:944 beforeSeek
+                let mut delivery = self.delivery.lock().unwrap();
+                before.get_or_insert_with(|| delivery.resume.clone());
+                delivery.epoch += 1;
+                delivery.resume = resume.clone();
+                delivery.stale
+            };
+            let answer = self
+                .connection
+                .sender()
+                .seek(self.id, message_id.clone(), timestamp)
+                .await;
+            let error = match answer {
+                Ok(_) => {
+                    // the broker moved, and closed the consumer
+                    self.delivery.lock().unwrap().pending_seek = Some(seek);
+                    self.reconnect().await?;
+                    return Ok(Ok(()));
+                }
+                Err(e) => e,
+            };
+            let delay = lost_or_not_ready(&error)
+                .then(|| {
+                    self.client
+                        .operation_retry_options
+                        .next_delay(started, attempt, max_backoff)
+                })
+                .flatten();
+            let Some(delay) = delay else {
+                // refused, or out of time: back where it was
+                let before = before.take().expect("set on the first attempt");
+                self.undo_seek(before, stale).await?;
+                return Ok(Err(error.into()));
+            };
+            warn!(
+                "consumer {}: seek failed, trying again in {delay:?}: {error}",
+                self.debug_format()
+            );
+            // The broker may not have moved, so nothing is filtered; a reader
+            // subscribes at the resume point, the target.
+            self.reconnect().await?;
+            if self.options.durable == Some(false) {
+                return Ok(Ok(()));
+            }
+            // A durable cursor moves only by a seek, which the reconnect may
+            // have outlasted the time for.
+            if started.elapsed() >= self.client.operation_retry_options.operation_timeout {
+                self.delivery.lock().unwrap().resume =
+                    before.take().expect("set on the first attempt");
+                return Ok(Err(seek_timed_out()));
+            }
+            self.client.executor.delay(delay).await;
+            attempt += 1;
+        }
+    }
+
+    /// Puts the resume point back after a seek that did not happen. The
+    /// epoch goes back too if the application skipped nothing as stale
+    /// meanwhile; otherwise a new subscription delivers that again.
+    async fn undo_seek(&mut self, before: Resume, stale: u64) -> Result<(), Error> {
+        let untouched = {
+            let mut delivery = self.delivery.lock().unwrap();
+            delivery.resume = before;
+            let untouched = delivery.stale == stale;
+            if untouched {
+                delivery.epoch = self.epoch;
+            }
+            untouched
+        };
+        if !untouched {
+            self.reconnect().await?;
+        }
+        Ok(())
     }
 
     /// Starts the redelivery clock for messages the application has taken
@@ -1268,6 +1431,26 @@ fn before_in_entry(first: &MessageIdData) -> Option<MessageIdData> {
         batch_index: Some(index - 1),
         ..first.clone()
     })
+}
+
+/// The error of a seek that waited for a reconnect past its time.
+fn seek_timed_out() -> Error {
+    Error::Consumer(ConsumerError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the seek ran out of time while the consumer reconnected",
+    )))
+}
+
+/// Whether a request went with its connection or found the broker not
+/// ready, so that it may go again.
+fn lost_or_not_ready(error: &ConnectionError) -> bool {
+    match error {
+        ConnectionError::Io(_) | ConnectionError::Disconnected | ConnectionError::SlowDown => true,
+        ConnectionError::PulsarError(kind, _) => {
+            *kind == Some(crate::message::proto::ServerError::ServiceNotReady)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

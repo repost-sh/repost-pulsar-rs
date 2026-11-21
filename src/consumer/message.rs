@@ -70,10 +70,12 @@ impl<T> Message<T> {
         &self.message_id.id
     }
 
-    /// The id an ack of this message carries to the engine: with the size of
-    /// its batch, so the engine can tell whether an ack covers the whole entry.
+    /// The id to ack this message by, with `Consumer::ack_with_id` and the
+    /// like: [`message_id`](Self::message_id) with the size of its batch, so
+    /// an ack covers this member of a batch only. `message_id` leaves the
+    /// size out, so that it equals the ids the broker reports.
     // Java: BatchMessageIdImpl carries batchSize
-    pub(crate) fn ack_id(&self) -> MessageIdData {
+    pub fn ack_id(&self) -> MessageIdData {
         MessageIdData {
             batch_size: self.message_id.batch_size,
             ..self.message_id.id.clone()

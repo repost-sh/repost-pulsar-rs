@@ -145,3 +145,31 @@ async fn a_slow_consumer_holds_one_window_across_reconnects() {
     take(&mut consumer, &mut delivered, 50).await;
     delivered.assert_exactly(&topic, 1..=50);
 }
+
+#[tokio::test]
+async fn messages_taken_and_not_acked_come_again_after_the_delay() {
+    let cluster = exclusive().await;
+    let topic = topic("acks-redelivered");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let mut consumer: Consumer<String, TokioExecutor> = pulsar
+        .consumer()
+        .with_topic(&topic)
+        .with_subscription("shared")
+        .with_subscription_type(SubType::Shared)
+        .with_unacked_message_resend_delay(Some(Duration::from_secs(2)))
+        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
+        .build()
+        .await
+        .expect("consumer");
+    publish(&pulsar, &topic, 1..=3).await;
+
+    let mut first = Delivered::default();
+    take(&mut consumer, &mut first, 3).await;
+    // none acked: the three come again once the delay has passed
+    let mut again = Delivered::default();
+    let redelivered =
+        tokio::time::timeout(Duration::from_secs(10), take(&mut consumer, &mut again, 3)).await;
+    assert!(redelivered.is_ok(), "no redelivery within ten seconds");
+    again.assert_exactly(&topic, 1..=3);
+}

@@ -1,6 +1,8 @@
 //! What a consumer delivers when the broker moves its topic: after an unload,
 //! a rolling restart or a crash, every message arrives once and in order.
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use pulsar::{reader::Reader, ConsumerOptions, TokioExecutor};
 
@@ -263,4 +265,135 @@ async fn a_consumer_follows_its_topic_when_the_broker_freezes() {
 
     collect(&mut consumer, &mut delivered, 10, DEADLINE).await;
     delivered.assert_exactly_ignoring_earlier(&topic, 6..=10);
+}
+
+// The window bounds what the broker sends ahead across a reconnect too: the
+// stale messages the application skips while its consumer is away must not
+// be granted twice.
+#[tokio::test]
+async fn a_reconnect_grants_no_more_than_the_window() {
+    let mut cluster = exclusive().await;
+    let topic = topic("flow-reconnect");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let survivor = 1 - owner;
+    let pulsar = cluster.client_via(survivor).await;
+    publish(&pulsar, &topic, 1..=3000).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    // the default window of 1000 fills the receive queue
+    cluster
+        .wait_subscription(&topic, "durable", |s| s.msg_out_counter >= 1000)
+        .await;
+    take(&mut consumer, &mut Delivered::default(), 100).await;
+
+    // The topic stays unowned for the broker's session timeout, ten seconds:
+    // meanwhile the application skips the 900 stale messages.
+    cluster.kill_broker(owner).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    take(&mut consumer, &mut Delivered::default(), 100).await;
+    cluster.wait_owner(&topic, survivor).await;
+
+    // 1000 granted at the reconnect; the 100 taken since free too few for a
+    // flow of their own. A broker granted more would have sent more by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let sent = cluster
+        .wait_subscription(&topic, "durable", |_| true)
+        .await
+        .msg_out_counter;
+    assert!(sent <= 1000, "{sent} sent since the reconnect");
+}
+
+// A seek made while the consumer is away fails on the dead connection; given
+// up on before the topic comes back, it must not leave the consumer dropping
+// everything after the reconnect.
+#[tokio::test]
+async fn a_seek_given_up_during_an_outage_leaves_the_consumer_working() {
+    let mut cluster = exclusive().await;
+    let topic = topic("seek-outage");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let survivor = 1 - owner;
+    let pulsar = cluster.client_via(survivor).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    publish(&pulsar, &topic, 1..=5).await;
+    let mut delivered = Delivered::default();
+    let taken = take(&mut consumer, &mut delivered, 5).await;
+    for message in &taken {
+        consumer.ack(message).await.expect("ack");
+    }
+
+    // the topic stays unowned for ten seconds
+    cluster.kill_broker(owner).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let seek = consumer.seek_to(&topic, taken[2].message_id().clone());
+    let given_up = tokio::time::timeout(Duration::from_secs(2), seek).await;
+    assert!(given_up.is_err(), "the seek ended during the outage");
+
+    cluster.wait_owner(&topic, survivor).await;
+    publish(&cluster.client_via(survivor).await, &topic, 6..=10).await;
+    collect(&mut consumer, &mut delivered, 10, DEADLINE).await;
+    delivered.assert_exactly_ignoring_earlier(&topic, 6..=10);
+}
+
+// The engine of a consumer with a redelivery delay keeps a timer of its own;
+// dropping the consumer must still close it on the broker.
+#[tokio::test]
+async fn a_dropped_consumer_with_a_redelivery_delay_lets_its_subscription_go() {
+    let cluster = exclusive().await;
+    let topic = topic("drop-redelivery");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let consumer = pulsar
+        .consumer()
+        .with_topic(&topic)
+        .with_subscription("held")
+        .with_subscription_type(pulsar::SubType::Exclusive)
+        .with_unacked_message_resend_delay(Some(Duration::from_secs(5)))
+        .build::<String>()
+        .await
+        .expect("consumer");
+    cluster
+        .wait_subscription(&topic, "held", |s| s.consumers.len() == 1)
+        .await;
+
+    drop(consumer);
+    cluster
+        .wait_subscription(&topic, "held", |s| s.consumers.is_empty())
+        .await;
+}
+
+// A seek made while the consumer is away waits for it within the operation
+// timeout only; one that would land after it fails instead of moving a
+// consumer that went on.
+#[tokio::test]
+async fn a_seek_that_outlives_its_timeout_during_an_outage_fails() {
+    let mut cluster = exclusive().await;
+    let topic = topic("seek-outage-timeout");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let survivor = 1 - owner;
+    // an operation timeout of three seconds
+    let pulsar = cluster.client_with_keepalive(survivor).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    publish(&pulsar, &topic, 1..=5).await;
+    // none acked, so the broker sends all five again after the crash
+    let taken = take(&mut consumer, &mut Delivered::default(), 5).await;
+
+    // the topic stays unowned for ten seconds
+    cluster.kill_broker(owner).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let seek = tokio::time::timeout(
+        DEADLINE,
+        consumer.seek_to(&topic, taken[2].message_id().clone()),
+    )
+    .await
+    .expect("an answer within the deadline");
+    assert!(seek.is_err(), "the seek waited past its time and went");
+
+    cluster.wait_owner(&topic, survivor).await;
+    publish(&cluster.client_via(survivor).await, &topic, 6..=10).await;
+    let mut again = Delivered::default();
+    collect(&mut consumer, &mut again, 10, DEADLINE).await;
+    // a seek gone through late would leave out 1 to 3
+    again.assert_exactly(&topic, 1..=10);
 }

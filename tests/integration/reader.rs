@@ -349,3 +349,26 @@ async fn messages_queued_before_a_seek_to_the_end_are_not_available() {
         .expect("seek");
     assert!(!available(&mut reader).await, "only stale messages queued");
 }
+
+// A message id belongs to one partition; Java hands it to every partition of
+// a reader, where it means nothing. A partitioned reader starts from the
+// earliest, the latest or a rollback, and seeks a partition by id.
+#[tokio::test]
+async fn a_partitioned_reader_refuses_a_start_message_id() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-partitioned-start");
+    cluster.create_partitioned_topic(&topic, 2).await;
+    let pulsar = cluster.client().await;
+    let start = MessageIdData {
+        ledger_id: 1,
+        entry_id: 0,
+        ..Default::default()
+    };
+    let reader = pulsar
+        .reader()
+        .with_topic(&topic)
+        .with_options(ConsumerOptions::default().starting_on_message(start))
+        .into_reader::<String>()
+        .await;
+    assert!(reader.is_err(), "a partitioned reader took a start id");
+}

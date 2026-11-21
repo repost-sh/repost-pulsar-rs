@@ -204,3 +204,29 @@ async fn individually_acked_members_of_a_batch_stay_acked_across_a_restart() {
         .wait_subscription(&topic, "batched", |s| s.msg_backlog == 0)
         .await;
 }
+
+// An ack by the id a message gives for acking covers that member only.
+#[tokio::test]
+async fn acking_members_of_a_batch_by_id_holds_across_a_restart() {
+    let cluster = exclusive().await;
+    let topic = topic("batch-ack-by-id");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish_batched(&pulsar, &topic, 1..=10).await;
+
+    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let taken = take(&mut first, &mut Delivered::default(), 10).await;
+    for message in &taken[7..] {
+        first
+            .ack_with_id(&topic, message.ack_id())
+            .await
+            .expect("ack");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    drop(first);
+
+    let mut second = earliest_consumer(&pulsar, &topic, "batched").await;
+    let mut delivered = Delivered::default();
+    collect(&mut second, &mut delivered, 7, DEADLINE).await;
+    delivered.assert_exactly(&topic, 1..=7);
+}

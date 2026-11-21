@@ -19,13 +19,16 @@ pub enum Queued {
 
 pub type MessageIdDataReceiver = mpsc::UnboundedReceiver<Result<Queued, Error>>;
 
-pub enum EngineEvent<Exe: Executor> {
+pub(crate) enum EngineEvent<Exe: Executor> {
     /// A frame from the broker, tagged with the epoch of its connection.
     Message(u64, Option<RawMessage>),
     EngineMessage(Option<EngineMessage<Exe>>),
     /// Once a second, so a connection that broke without closing is noticed
     /// even when nothing else happens.
     Tick,
+    /// Time to look for taken messages left unacked past the redelivery
+    /// delay.
+    RedeliveryTick,
 }
 
 /// Where a non-durable subscription starts again after a reconnect.
@@ -82,6 +85,12 @@ pub(crate) struct Delivery {
     /// reconnect grants only what this leaves of the window, so stale
     /// messages still queued do not add up across reconnects.
     pub queued: u32,
+    /// A reconnect has not granted its window yet. Permits freed meanwhile
+    /// are in that grant, so none flow on their own.
+    pub granting: bool,
+    /// Messages the application skipped as stale, ever. A seek that did not
+    /// happen lowers its epoch again only if this did not move.
+    pub stale: u64,
     /// Messages the application took, and when, for the redelivery timer.
     /// Only kept when a redelivery delay is set.
     pub taken: Option<Vec<(MessageIdData, Instant)>>,
@@ -104,22 +113,41 @@ impl Delivery {
     }
 
     pub fn free_permits(&mut self, permits: u32) -> Option<u32> {
+        // a reconnect's grant counts these
+        if self.granting {
+            return None;
+        }
         self.freed += permits;
         (self.freed >= self.refill).then(|| std::mem::take(&mut self.freed))
     }
+
+    /// A reconnect began: what the old connection freed is void.
+    pub fn reconnecting(&mut self) {
+        self.freed = 0;
+        self.granting = true;
+    }
+
+    /// The permits a reconnect grants: the window, less the stale messages
+    /// still queued. Those taken since the reconnect began are in it already.
+    pub fn grant(&mut self, window: u32) -> u32 {
+        self.granting = false;
+        window.saturating_sub(self.queued)
+    }
 }
 
-pub enum EngineMessage<Exe: Executor> {
+/// Where the engine answers a seek.
+pub(crate) type SeekReply = oneshot::Sender<Result<(), Error>>;
+
+pub(crate) enum EngineMessage<Exe: Executor> {
     Ack(MessageIdData, bool),
     Nack(MessageIdData),
-    UnackedRedelivery,
     GetConnection(oneshot::Sender<Arc<Connection<Exe>>>),
     /// Permits the application has freed by taking messages delivered on the
     /// connection of this epoch.
     Flow(u64, u32),
-    /// A seek to this id failed after a reconnect had already applied it, so
-    /// its start filter must go.
-    CancelSeek(MessageIdData),
+    /// Move the subscription, and answer once it moved or could not. The
+    /// seek has the operation timeout from when it was made.
+    Seek(Seek, Instant, SeekReply),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -140,4 +168,28 @@ pub struct DeadLetterPolicy {
 /// Where `id` sits in delivery order.
 pub(crate) fn position(id: &MessageIdData) -> (u64, u64, i32) {
     (id.ledger_id, id.entry_id, id.batch_index.unwrap_or(-1))
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::Delivery;
+
+    #[test]
+    fn permits_freed_before_a_reconnect_grants_go_with_the_grant() {
+        // a window of ten, a flow per five freed
+        let mut delivery = Delivery::new(10, false);
+        delivery.queued = 8;
+        delivery.reconnecting();
+        // stale messages taken before the grant: counted in it
+        for _ in 0..6 {
+            delivery.queued -= 1;
+            assert_eq!(delivery.free_permit(), None);
+        }
+        assert_eq!(delivery.grant(10), 8);
+        // the two still queued, and three fresh ones, make the next flow
+        for _ in 0..4 {
+            assert_eq!(delivery.free_permit(), None);
+        }
+        assert_eq!(delivery.free_permit(), Some(5));
+    }
 }

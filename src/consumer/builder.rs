@@ -420,6 +420,19 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         warn!("Subscription Type for a reader is `Exclusive`. Resetting.");
         validated.config.sub_type = SubType::Exclusive;
 
+        // An id belongs to one partition; Java hands it to every one.
+        if validated.config.options.start_message_id.is_some()
+            && validated
+                .partitioned
+                .values()
+                .any(|&partitions| partitions > 1)
+        {
+            return Err(Error::Custom(
+                "a message id starts one partition: start a partitioned reader at the \
+                 earliest, the latest or a rollback, and seek_to a partition"
+                    .to_string(),
+            ));
+        }
         let consumer = self.assemble(validated).await?;
         Ok(Reader { consumer, topic })
     }

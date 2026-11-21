@@ -6,13 +6,12 @@ use std::{
         Arc, Mutex,
     },
     task::{Context, Poll},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use futures::{
     channel::{mpsc, oneshot},
-    FutureExt, SinkExt, Stream, StreamExt,
+    FutureExt, SinkExt, Stream,
 };
 
 use crate::{
@@ -40,8 +39,6 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     topic: String,
     messages: Pin<Box<MessageIdDataReceiver>>,
     delivery: Arc<Mutex<Delivery>>,
-    executor: Arc<Exe>,
-    operation_timeout: Duration,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -95,25 +92,6 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
 
         let (engine_tx, engine_rx) = mpsc::unbounded();
 
-        if unacked_message_redelivery_delay.is_some() {
-            let mut redelivery_tx = engine_tx.clone();
-            let mut interval = client.executor.interval(Duration::from_millis(500));
-            let res = client.executor.spawn(Box::pin(async move {
-                while interval.next().await.is_some() {
-                    if redelivery_tx
-                        .send(EngineMessage::UnackedRedelivery)
-                        .await
-                        .is_err()
-                    {
-                        // Consumer shut down - stop ticker
-                        break;
-                    }
-                }
-            }));
-            if res.is_err() {
-                return Err(Error::Executor);
-            }
-        }
         // Unbounded, because the permits already bound it.
         let (tx, rx) = mpsc::unbounded();
         let delivery = Arc::new(Mutex::new(Delivery {
@@ -154,8 +132,6 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             topic,
             messages: Box::pin(rx),
             delivery,
-            executor: client.executor.clone(),
-            operation_timeout: client.operation_retry_options.operation_timeout,
             engine_tx,
             data_type: PhantomData,
             dead_letter_policy,
@@ -255,16 +231,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         message_id: Option<MessageIdData>,
         timestamp: Option<u64>,
     ) -> Result<(), Error> {
-        let consumer_id = self.consumer_id;
-        // The broker closes the consumer before it confirms the seek, so the
-        // engine's reconnect has to find the target before the request goes.
-        // Java: ConsumerImpl.java:3048 seekAsyncInternal sets seekMessageId
-        // first and restores it if the seek fails.
-        // Raising the epoch keeps what is buffered from before the seek from
-        // reaching the application, as Java clears the queue first.
-        // Java: MultiTopicsConsumerImpl.java:944 beforeSeek
-        let seek = match (&message_id, timestamp) {
-            (Some(target), _) => Seek::Id(target.clone()),
+        let seek = match (message_id, timestamp) {
+            (Some(target), _) => Seek::Id(target),
             (None, Some(publish_time_ms)) => Seek::Time(publish_time_ms),
             (None, None) => {
                 return Err(Error::Custom(
@@ -272,68 +240,15 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 ))
             }
         };
-        let mut guard = {
-            let mut delivery = self.delivery.lock().unwrap();
-            let resume = match &seek {
-                Seek::Id(target) => Resume::After(target.clone()),
-                Seek::Time(publish_time_ms) => Resume::Time(*publish_time_ms),
-            };
-            let before = (
-                std::mem::replace(&mut delivery.resume, resume),
-                delivery.pending_seek.replace(seek.clone()),
-            );
-            delivery.epoch += 1;
-            SeekGuard {
-                delivery: self.delivery.clone(),
-                engine_tx: self.engine_tx.clone(),
-                epoch: delivery.epoch,
-                target: message_id.clone(),
-                before: Some(before),
-                sent: false,
-            }
-        };
-        // Java: ConsumerImpl.java:3043 seekAsyncInternal retries until the
-        // operation timeout, so a seek survives a broker failover. A seek
-        // that failed would leave the reconnect's start filter in place.
-        let deadline = std::time::Instant::now() + self.operation_timeout;
-        let mut retries = 0;
-        let result = loop {
-            // A reconnect may have taken the target meanwhile; the next
-            // reconnect, after this attempt, needs it again.
-            self.delivery.lock().unwrap().pending_seek = Some(seek.clone());
-            let attempt = match self.connection().await {
-                Ok(connection) => {
-                    // cancelled from here on, the seek may have reached the
-                    // broker, so it stays
-                    guard.sent = true;
-                    connection
-                        .sender()
-                        .seek(consumer_id, message_id.clone(), timestamp)
-                        .await
-                        .map(drop)
-                }
-                Err(e) => Err(ConnectionError::Unexpected(e.to_string())),
-            };
-            match attempt {
-                Err(e) if lost_or_not_ready(&e) && std::time::Instant::now() < deadline => {
-                    let delay = crate::connection_manager::backoff(
-                        Duration::from_millis(100),
-                        Duration::from_secs(2),
-                        retries,
-                    );
-                    self.executor.delay(delay).await;
-                    retries += 1;
-                }
-                result => break result,
-            }
-        };
-        match &result {
-            Ok(()) => guard.before = None,
-            Err(_) => guard.sent = false,
-        }
-        drop(guard);
-        result?;
-        Ok(())
+        // The engine makes the seek and sees it through: one dropped here
+        // still happens, or fails as a whole.
+        let (reply, answer) = oneshot::channel();
+        self.engine_tx
+            .unbounded_send(EngineMessage::Seek(seek, std::time::Instant::now(), reply))
+            .map_err(|_| Error::Consumer(ConsumerError::Closed))?;
+        answer
+            .await
+            .map_err(|_| Error::Consumer(ConsumerError::Closed))?
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -465,6 +380,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                         let mut delivery = self.delivery.lock().unwrap();
                         delivery.queued = delivery.queued.saturating_sub(1);
                         if epoch != delivery.epoch {
+                            delivery.stale += 1;
                             // its slot in the window is free for the new
                             // connection now
                             if let Some(permits) = delivery.free_permit() {
@@ -507,60 +423,5 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                 }
             }
         }
-    }
-}
-
-/// Puts the delivery state back when a seek fails, or is dropped before its
-/// request went out.
-struct SeekGuard<Exe: Executor> {
-    delivery: Arc<Mutex<Delivery>>,
-    engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
-    /// The epoch the seek raised.
-    epoch: u64,
-    target: Option<MessageIdData>,
-    /// The resume point and pending seek the seek replaced; `None` once the
-    /// broker confirmed it.
-    before: Option<(Resume, Option<Seek>)>,
-    /// The request may have reached the broker, which then moves whatever the
-    /// application does; a failure answered by the broker clears it again.
-    sent: bool,
-}
-
-impl<Exe: Executor> Drop for SeekGuard<Exe> {
-    fn drop(&mut self) {
-        let Some((resume, pending_seek)) = self.before.take() else {
-            return;
-        };
-        if self.sent {
-            return;
-        }
-        let Ok(mut delivery) = self.delivery.lock() else {
-            return;
-        };
-        if delivery.epoch == self.epoch {
-            delivery.epoch -= 1;
-            delivery.resume = resume;
-            delivery.pending_seek = pending_seek;
-        } else {
-            // a reconnect applied the target, but the broker never moved
-            delivery.pending_seek = None;
-            if let Some(target) = self.target.take() {
-                let _ = self
-                    .engine_tx
-                    .unbounded_send(EngineMessage::CancelSeek(target));
-            }
-        }
-    }
-}
-
-/// Failures of a seek that a reconnect can fix: the connection was lost, or
-/// the broker was not ready. A refusal fails the seek at once.
-fn lost_or_not_ready(error: &ConnectionError) -> bool {
-    match error {
-        ConnectionError::Io(_) | ConnectionError::Disconnected | ConnectionError::SlowDown => true,
-        ConnectionError::PulsarError(kind, _) => {
-            *kind == Some(crate::message::proto::ServerError::ServiceNotReady)
-        }
-        _ => false,
     }
 }
