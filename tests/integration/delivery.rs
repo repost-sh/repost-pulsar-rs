@@ -11,7 +11,7 @@ use pulsar::{
     consumer::{InitialPosition, Message},
     producer::ProducerOptions,
     reader::Reader,
-    Consumer, ConsumerOptions, Error, Pulsar, SubType, TokioExecutor,
+    Consumer, ConsumerOptions, Error, Producer, Pulsar, SubType, TokioExecutor,
 };
 
 /// An Exclusive, durable consumer that starts at the earliest message.
@@ -21,6 +21,25 @@ pub async fn earliest_consumer(
     subscription: &str,
 ) -> Consumer<String, TokioExecutor> {
     earliest_consumer_with(pulsar, topic, subscription, ConsumerOptions::default()).await
+}
+
+/// A Failover consumer named `name` that starts at the earliest message. All
+/// of them share one subscription, so on one topic they form one group.
+pub async fn failover_consumer(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+    name: &str,
+) -> Consumer<String, TokioExecutor> {
+    pulsar
+        .consumer()
+        .with_topic(topic)
+        .with_subscription("failover")
+        .with_subscription_type(SubType::Failover)
+        .with_consumer_name(name)
+        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
+        .build()
+        .await
+        .expect("consumer")
 }
 
 /// [`earliest_consumer`] with other options as well.
@@ -111,7 +130,16 @@ pub async fn publish_batched(
     topic: &str,
     numbers: RangeInclusive<u64>,
 ) {
-    let mut producer = pulsar
+    publish_with(&mut batching_producer(pulsar, topic).await, numbers).await;
+}
+
+/// A producer that puts up to ten messages in one entry, sent when the tenth
+/// arrives or [`publish_with`] flushes it.
+pub async fn batching_producer(
+    pulsar: &Pulsar<TokioExecutor>,
+    topic: &str,
+) -> Producer<TokioExecutor> {
+    pulsar
         .producer()
         .with_topic(topic)
         .with_options(ProducerOptions {
@@ -121,7 +149,12 @@ pub async fn publish_batched(
         })
         .build()
         .await
-        .expect("producer");
+        .expect("producer")
+}
+
+/// Sends `numbers` through `producer`, flushes them if it batches, and waits
+/// for every receipt.
+pub async fn publish_with(producer: &mut Producer<TokioExecutor>, numbers: RangeInclusive<u64>) {
     let mut receipts = Vec::new();
     for number in numbers {
         receipts.push(
@@ -131,10 +164,21 @@ pub async fn publish_batched(
                 .expect("send"),
         );
     }
-    producer.send_batch().await.expect("flush");
+    if producer.options().batch_size.is_some() {
+        producer.send_batch().await.expect("flush");
+    }
     for receipt in receipts {
         receipt.await.expect("receipt");
     }
+}
+
+/// The number a message of [`publish`] or its variants carries.
+pub fn number(message: &Message<String>) -> u64 {
+    message
+        .deserialize()
+        .expect("utf-8 payload")
+        .parse()
+        .expect("numbered payload")
 }
 
 /// The numbers delivered on each topic or partition, in delivery order.
@@ -145,15 +189,10 @@ pub struct Delivered {
 
 impl Delivered {
     pub fn record(&mut self, message: &Message<String>) {
-        let number = message
-            .deserialize()
-            .expect("utf-8 payload")
-            .parse()
-            .expect("numbered payload");
         self.by_topic
             .entry(message.topic.clone())
             .or_default()
-            .push(number);
+            .push(number(message));
     }
 
     /// How many different numbers `topic` delivered.

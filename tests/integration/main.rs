@@ -17,6 +17,7 @@ mod batch_acks;
 mod cluster;
 mod delivery;
 mod events;
+mod failover_seek;
 mod partitions;
 mod producer;
 mod reader;

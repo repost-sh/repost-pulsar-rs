@@ -3,14 +3,11 @@
 
 use std::time::Duration;
 
-use pulsar::{
-    consumer::InitialPosition, Consumer, ConsumerEvent, ConsumerItem, ConsumerOptions, Pulsar,
-    SubType, TokioExecutor,
-};
+use pulsar::{Consumer, ConsumerEvent, ConsumerItem, TokioExecutor};
 
 use crate::{
     cluster::{exclusive, partition, topic},
-    delivery::{publish, take, Delivered, DEADLINE},
+    delivery::{failover_consumer, number, publish, take, Delivered, DEADLINE},
 };
 
 /// One thing a consumer handed the application.
@@ -18,23 +15,6 @@ use crate::{
 enum Seen {
     Event { topic: String, active: bool },
     Message { topic: String, number: u64 },
-}
-
-async fn failover_consumer(
-    pulsar: &Pulsar<TokioExecutor>,
-    topic: &str,
-    name: &str,
-) -> Consumer<String, TokioExecutor> {
-    pulsar
-        .consumer()
-        .with_topic(topic)
-        .with_subscription("failover")
-        .with_subscription_type(SubType::Failover)
-        .with_consumer_name(name)
-        .with_options(ConsumerOptions::default().with_initial_position(InitialPosition::Earliest))
-        .build()
-        .await
-        .expect("consumer")
 }
 
 /// What `consumer` hands over until `done` holds of it, and then until two
@@ -64,7 +44,7 @@ async fn gather(
             }),
             Ok(Some(Ok(ConsumerItem::Message(message)))) => seen.push(Seen::Message {
                 topic: message.topic.clone(),
-                number: message.deserialize().unwrap().parse().unwrap(),
+                number: number(&message),
             }),
             Ok(Some(Err(e))) => panic!("consumer failed: {e}"),
             Ok(None) => panic!("consumer ended"),

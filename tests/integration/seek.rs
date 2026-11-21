@@ -8,7 +8,7 @@ use pulsar::ConsumerOptions;
 use crate::{
     cluster::{exclusive, partition, topic},
     delivery::{
-        collect, earliest_consumer, earliest_consumer_with, earliest_reader, publish,
+        collect, earliest_consumer, earliest_consumer_with, earliest_reader, number, publish,
         publish_around_a_time, take, Delivered, DEADLINE,
     },
 };
@@ -211,8 +211,7 @@ async fn no_message_from_before_a_seek_arrives_after_it() {
         })
         .await
         .expect("a message within the deadline");
-        let number: u64 = next[0].deserialize().unwrap().parse().unwrap();
-        assert_eq!(number, target as u64 + 2, "round {round}");
+        assert_eq!(number(&next[0]), target as u64 + 2, "round {round}");
     }
 }
 

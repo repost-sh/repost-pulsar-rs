@@ -79,6 +79,14 @@ pub fn partition(topic: &str, index: u32) -> String {
     format!("{topic}-partition-{index}")
 }
 
+/// The index of a partition, from the name [`partition`] gives it.
+pub fn index(partition: &str) -> u32 {
+    partition
+        .rsplit_once("-partition-")
+        .and_then(|(_, index)| index.parse().ok())
+        .expect("a partition name")
+}
+
 /// A fresh topic name in `namespace`.
 pub fn topic_in(namespace: &str, prefix: &str) -> String {
     format!("persistent://{namespace}/{prefix}-{}", uuid::Uuid::new_v4())
