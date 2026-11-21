@@ -43,8 +43,11 @@ Upgrading needs code changes, and some behaviour changes without one:
   timeout. A seek made after the consumer's engine stopped fails with
   `ConsumerError::Closed`.
 - **An error on a consumer's stream is not its end.** Keep polling: the
-  engine carries on. Errors a retry cannot fix (a deleted topic,
-  permissions, schema) still end the partition they concern.
+  engine carries on. Once a consumer or producer exists, only a deleted
+  topic ends it (and, for a producer, a terminated topic or a fenced
+  producer), as in Java. An authorization or policy refusal is retried and
+  told once per outage: brokers also give it when their authorization check
+  fails, a metadata timeout say.
 - **Every error on a consumer's stream comes as `ConsumerError::Topic`**,
   single topics included; `Error::without_topic` and `server_error` look
   inside.
@@ -62,8 +65,10 @@ Upgrading needs code changes, and some behaviour changes without one:
   latest or a rollback, and `seek_to` a partition.
 - **Ack a batched message by `Message::ack_id()`** with `ack_with_id` and the
   like: it carries the batch size, so the ack covers that message only.
-  `message_id()` leaves it out, so it equals the ids the broker reports; an
-  ack by it, individual or cumulative, covers the whole entry, as in Java.
+  `message_id()` leaves it out, so it equals the ids the broker reports. A
+  durable consumer finds the size of the batches it delivered (the last
+  10,000), so an ack by `message_id()` covers that message too; for any
+  other entry it covers the whole entry, as in Java.
 - **Engine internals in `consumer::data` changed**: `EngineMessage` (also
   re-exported as `consumer::EngineMessage`) and `EngineEvent` are no longer
   public, `MessageIdDataReceiver` carries `Queued` items, and `Queued` is
@@ -84,13 +89,20 @@ Upgrading needs code changes, and some behaviour changes without one:
   the window.
 - Acking part of a batch no longer acks the whole entry.
 - Failover subscriptions report `ConsumerEvent::BecameActive` and
-  `BecameInactive` per partition, through `Consumer::next_item`.
+  `BecameInactive` per partition, through `Consumer::next_item`. A
+  consumer's own seek tells it nothing new unless the broker gives the
+  partition to another consumer meanwhile; don't seek on every activation,
+  as a group of consumers doing so can hand a partition back and forth.
 - Partitioned readers, `ConsumerOptions::with_start_rollback`, and
   `has_message_available` on consumers and readers.
 - Partitions added to a topic are found while the consumer runs.
 - Seeks hold up under failures: a lost connection sends the seek again once
   the consumer is back, and a refused one leaves the subscription where it
-  was, with nothing filtered.
+  was, with nothing filtered. After a seek, only the target's own entry is
+  filtered, as in Java, so a cursor an operator moves back is delivered. A
+  reader's seek by time holds across reconnects, also on brokers that retire
+  the subscription on a seek, and stays exact: the client drops what the
+  protocol's whole-second rollback lets in from before the target.
 - A dropped consumer closes on the broker even with a redelivery delay set.
 - Acks and nacks by id accept a partition's short or full name, as `seek_to`
   does.
@@ -110,6 +122,14 @@ Upgrading needs code changes, and some behaviour changes without one:
 - One retry rule, after Java's `isRetriableError`, for subscribe, producer
   creation and lookups, with a backoff from `retry_delay` to `max_backoff`
   that spreads retries at every step.
+- A keepalive ping unanswered within the keepalive interval (at most the
+  operation timeout) marks its connection broken, as Java's keepalive does,
+  and a reconnect does not wait on a broken connection to close: a frozen
+  broker is left within a keepalive interval, not after two operation
+  timeouts.
+- A connect given up on halfway, by an application timeout around a build
+  say, no longer leaves the next one waiting for ever, and concurrent pings
+  on one connection no longer cancel each other.
 - A refused credential is retried with whatever the provider hands out next,
   and the consumer's stream reports it once per outage.
 - Protocol version 19, with token refresh on the broker's challenge.

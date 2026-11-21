@@ -108,7 +108,11 @@ pub(crate) struct Receiver<S: Stream<Item = Result<Message, ConnectionError>>> {
     received_messages: BTreeMap<RequestKey, Message>,
     registrations: Pin<Box<mpsc::UnboundedReceiver<Register>>>,
     shutdown: Pin<Box<oneshot::Receiver<()>>>,
-    ping: Option<oneshot::Sender<()>>,
+    /// Everyone waiting for a pong: one pong answers all the pings before it.
+    pings: Vec<oneshot::Sender<()>>,
+    /// Pongs that came before their ping's registration, which waits behind
+    /// inbound frames while traffic is steady.
+    early_pongs: u32,
     auth_challenge: mpsc::UnboundedSender<()>,
     closed_producers: ClosedProducers,
 }
@@ -133,7 +137,8 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
             consumers: BTreeMap::new(),
             registrations: Box::pin(registrations),
             shutdown: Box::pin(shutdown),
-            ping: None,
+            pings: Vec::new(),
+            early_pongs: 0,
             auth_challenge,
             closed_producers,
         }
@@ -188,7 +193,12 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                     self.consumers.remove(&consumer_id);
                 }
                 Poll::Ready(Some(Register::Ping { resolver })) => {
-                    self.ping = Some(resolver);
+                    if self.early_pongs > 0 {
+                        self.early_pongs -= 1;
+                        let _ = resolver.send(());
+                    } else {
+                        self.pings.push(resolver);
+                    }
                 }
                 Poll::Ready(None) => {
                     self.error.set(ConnectionError::Disconnected);
@@ -215,7 +225,10 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             command: BaseCommand { pong: Some(_), .. },
                             ..
                         } => {
-                            if let Some(sender) = self.ping.take() {
+                            if self.pings.is_empty() {
+                                self.early_pongs += 1;
+                            }
+                            for sender in self.pings.drain(..) {
                                 let _ = sender.send(());
                             }
                         }
@@ -428,6 +441,12 @@ impl<Exe: Executor> ConnectionSender<Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn send_ping(&self) -> Result<(), ConnectionError> {
+        self.send_ping_within(self.operation_timeout).await
+    }
+
+    /// Pings, and marks the connection broken unless the pong comes within
+    /// `timeout`.
+    pub(crate) async fn send_ping_within(&self, timeout: Duration) -> Result<(), ConnectionError> {
         let (resolver, response) = oneshot::channel();
         trace!("sending ping to connection {}", self.connection_id);
 
@@ -437,8 +456,8 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             self.control_tx.send(messages::ping()).await?,
         ) {
             (Ok(_), ()) => {
-                debug!("set timeout to {:?} for ping-pong", self.operation_timeout);
-                let delay_f = self.executor.delay(self.operation_timeout);
+                debug!("set timeout to {:?} for ping-pong", timeout);
+                let delay_f = self.executor.delay(timeout);
                 pin_mut!(response);
                 pin_mut!(delay_f);
 

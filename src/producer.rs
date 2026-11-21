@@ -1147,7 +1147,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
             drop(state);
             let reconnected = self.spawn_reconnect(epoch)?;
             match self.wait_until(reconnected, deadline).await {
-                Some(Ok(Err(e))) if is_permanent(&e) => return Err(e),
+                Some(Ok(Err(e))) if ends_producer(&e) => return Err(e),
                 Some(Ok(Ok(()))) => {} // re-created: send again
                 // failed for now: try again, and give it as the cause if time runs out,
                 // unless a re-creation succeeded since
@@ -1245,7 +1245,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
             }
             match result {
                 Ok(()) => break,
-                Err(e) if is_permanent(&e) => {
+                Err(e) if ends_producer(&e) => {
                     let messages = std::mem::take(&mut self.pending.lock().unwrap().messages);
                     for (_, message) in messages {
                         let error = match &e {
@@ -1340,11 +1340,22 @@ impl<Exe: Executor> ProducerConnection<Exe> {
             self.topic,
             state.connection.id()
         );
-        if let Err(e) = state.connection.sender().close_producer(self.id).await {
-            error!(
-                "could not close producer {:?}({}) for topic {}: {:?}",
-                self.name, self.id, self.topic, e
-            );
+        // Without waiting on a broken connection, a frozen broker's say,
+        // which would hold the close for the whole operation timeout. A
+        // stalled socket that still works hears the close all the same.
+        if state.connection.is_valid() {
+            if let Err(e) = state.connection.sender().close_producer(self.id).await {
+                error!(
+                    "could not close producer {:?}({}) for topic {}: {:?}",
+                    self.name, self.id, self.topic, e
+                );
+            }
+        } else {
+            let connection = state.connection.clone();
+            let id = self.id;
+            let _ = self.client.executor.spawn(Box::pin(async move {
+                let _ = connection.sender().close_producer(id).await;
+            }));
         }
         // One attempt at each step: reconnect() backs off between attempts, and the state lock
         // is held meanwhile.
@@ -1467,9 +1478,9 @@ impl<Exe: Executor> ProducerConnection<Exe> {
 }
 
 /// Errors after which re-creating the producer cannot succeed.
-fn is_permanent(error: &Error) -> bool {
+fn ends_producer(error: &Error) -> bool {
     matches!(error, Error::Producer(ProducerError::Closed))
-        || error.server_error().is_some_and(error::is_permanent)
+        || error.server_error().is_some_and(error::ends_after_creation)
 }
 
 impl<Exe: Executor> std::ops::Drop for TopicProducer<Exe> {

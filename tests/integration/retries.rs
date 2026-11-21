@@ -124,3 +124,32 @@ async fn a_client_connects_anew_to_a_broker_that_came_back() {
     collect(&mut consumer_b, &mut delivered, 2, DEADLINE).await;
     delivered.assert_exactly(&topic_b, 1..=2);
 }
+
+// A connect given up on halfway, as an application timeout around a build
+// does, must not leave the next one waiting on it for ever.
+#[tokio::test]
+async fn a_connect_given_up_on_does_not_block_the_next() {
+    let mut cluster = exclusive().await;
+    let topic = topic("retries-abandoned-connect");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let pulsar = cluster.client_via(1 - owner).await;
+
+    // the owner takes the connection and never answers on it
+    cluster.pause_broker(owner).await;
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        earliest_consumer(&pulsar, &topic, "durable"),
+    )
+    .await;
+    assert!(first.is_err(), "built against a frozen broker");
+
+    // back before its session expires, it still owns the topic
+    cluster.resume_broker(owner).await;
+    let second =
+        tokio::time::timeout(DEADLINE, earliest_consumer(&pulsar, &topic, "durable")).await;
+    assert!(
+        second.is_ok(),
+        "the next build waited on the abandoned connect"
+    );
+}

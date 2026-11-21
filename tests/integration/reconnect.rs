@@ -397,3 +397,79 @@ async fn a_seek_that_outlives_its_timeout_during_an_outage_fails() {
     // a seek gone through late would leave out 1 to 3
     again.assert_exactly(&topic, 1..=10);
 }
+
+// A refusal that a policy change lifts, here a subscription type turned off,
+// must not end the consumer: Java retries everything but a deleted topic.
+#[tokio::test]
+async fn a_consumer_refused_on_reconnect_comes_back_once_allowed() {
+    let cluster = exclusive().await;
+    let namespace = "public/subscription-types";
+    cluster.allow_subscription_types(namespace, &[]).await;
+    let topic = topic_in(namespace, "refused");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    publish(&pulsar, &topic, 1..=1).await;
+    take(&mut consumer, &mut Delivered::default(), 1).await;
+
+    // the Exclusive subscription is refused once the topic moves
+    cluster
+        .allow_subscription_types(namespace, &["Shared"])
+        .await;
+    cluster.unload(&topic).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cluster.allow_subscription_types(namespace, &[]).await;
+    publish(&pulsar, &topic, 2..=3).await;
+
+    let mut delivered = Delivered::default();
+    let give_up = tokio::time::Instant::now() + DEADLINE;
+    while delivered.distinct() < 3 && tokio::time::Instant::now() < give_up {
+        match tokio::time::timeout(Duration::from_secs(3), consumer.next()).await {
+            Ok(Some(Ok(message))) => delivered.record(&message),
+            // the refusal, told once
+            Ok(Some(Err(_))) | Err(_) => {}
+            Ok(None) => panic!("the consumer ended on a refusal"),
+        }
+    }
+    delivered.assert_exactly_ignoring_earlier(&topic, 2..=3);
+}
+
+// A frozen broker leaves its connections open: the reconnect must not wait
+// out the operation timeout on one it already knows is broken.
+#[tokio::test]
+async fn a_consumer_leaves_a_frozen_broker_without_waiting_for_it() {
+    let mut cluster = exclusive().await;
+    let topic = topic("reconnect-frozen-default");
+    cluster.create_topic(&topic).await;
+    let owner = cluster.owner(&topic).await;
+    let survivor = 1 - owner;
+    // A keepalive of one second notices the freeze, and short connects and
+    // backoffs come back fast once the topic moved; the operation timeout,
+    // which a close on the broken connection would wait out, stays at 30 s.
+    let pulsar = cluster
+        .client_with(
+            survivor,
+            pulsar::ConnectionRetryOptions {
+                keep_alive: Duration::from_secs(1),
+                connection_timeout: Duration::from_secs(2),
+                max_backoff: Duration::from_secs(2),
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    publish(&pulsar, &topic, 1..=1).await;
+    take(&mut consumer, &mut Delivered::default(), 1).await;
+
+    cluster.pause_broker(owner).await;
+    cluster.wait_owner(&topic, survivor).await;
+    publish(&cluster.client_via(survivor).await, &topic, 2..=2).await;
+    let published = tokio::time::Instant::now();
+    take(&mut consumer, &mut Delivered::default(), 1).await;
+    assert!(
+        published.elapsed() < Duration::from_secs(10),
+        "the consumer came back {:?} after the topic did",
+        published.elapsed()
+    );
+}

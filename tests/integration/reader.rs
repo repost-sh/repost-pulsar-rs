@@ -372,3 +372,26 @@ async fn a_partitioned_reader_refuses_a_start_message_id() {
         .await;
     assert!(reader.is_err(), "a partitioned reader took a start id");
 }
+
+// A seek by time lands on the first message published at or after it. The
+// protocol's rollback counts whole seconds, so after the seek's reconnect the
+// client drops what that lets in.
+#[tokio::test]
+async fn a_reader_seeking_by_time_gets_nothing_published_before() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-time-seek-exact");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    for number in 1..=10 {
+        publish(&pulsar, &topic, number..=number).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let mut reader = earliest_reader(&pulsar, &topic, "reader").await;
+    let taken = take(&mut reader, &mut Delivered::default(), 10).await;
+
+    let target = taken[5].metadata().publish_time;
+    reader.seek(None, Some(target)).await.expect("seek");
+    let mut delivered = Delivered::default();
+    collect(&mut reader, &mut delivered, 5, DEADLINE).await;
+    delivered.assert_exactly(&topic, 6..=10);
+}

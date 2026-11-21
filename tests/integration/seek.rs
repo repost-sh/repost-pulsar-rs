@@ -1,6 +1,8 @@
 //! Seeking a consumer on a partitioned topic: one partition at a time, or all
 //! of them to a publish time, without disturbing the rest.
 
+use std::time::Duration;
+
 use pulsar::ConsumerOptions;
 
 use crate::{
@@ -248,4 +250,28 @@ async fn a_seek_cancelled_after_it_went_out_still_takes_effect() {
     let mut after = Delivered::default();
     collect(&mut consumer, &mut after, 19, DEADLINE).await;
     after.assert_exactly(&topic, 2..=20);
+}
+
+// After a seek, only the target's own entry is the client's to drop; an
+// operator who then moves the cursor back gets the replay.
+#[tokio::test]
+async fn a_cursor_reset_after_a_seek_is_delivered() {
+    let cluster = exclusive().await;
+    let topic = topic("seek-then-reset");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &topic, 1..=5).await;
+    let mut consumer = earliest_consumer(&pulsar, &topic, "durable").await;
+    let taken = take(&mut consumer, &mut Delivered::default(), 5).await;
+    // caught up: nothing after the target arrives to end the seek's filter
+    consumer
+        .seek_to(&topic, taken[4].message_id().clone())
+        .await
+        .expect("seek");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    cluster.reset_cursor(&topic, "durable", 0).await;
+    let mut delivered = Delivered::default();
+    collect(&mut consumer, &mut delivered, 5, DEADLINE).await;
+    delivered.assert_exactly(&topic, 1..=5);
 }

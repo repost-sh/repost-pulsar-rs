@@ -331,18 +331,18 @@ impl Cluster {
     /// Like [`Cluster::client_via`], with a fast keepalive so a frozen broker
     /// is noticed within seconds.
     pub async fn client_with_keepalive(&self, broker: usize) -> Pulsar<TokioExecutor> {
-        Pulsar::builder(service_url(broker), TokioExecutor)
-            .with_connection_retry_options(pulsar::ConnectionRetryOptions {
+        self.client_with(
+            broker,
+            pulsar::ConnectionRetryOptions {
                 keep_alive: Duration::from_secs(1),
                 ..Default::default()
-            })
-            .with_operation_retry_options(pulsar::OperationRetryOptions {
+            },
+            pulsar::OperationRetryOptions {
                 operation_timeout: Duration::from_secs(3),
                 ..Default::default()
-            })
-            .build()
-            .await
-            .expect("connect to the cluster")
+            },
+        )
+        .await
     }
 
     /// A client whose lookups go through `broker`. Fault tests bootstrap
@@ -420,9 +420,55 @@ impl Cluster {
         .await;
     }
 
-    /// Creates [`STRICT_NAMESPACE`] if it is missing.
-    pub async fn ensure_strict_namespace(&self) {
-        let path = format!("admin/v2/namespaces/{STRICT_NAMESPACE}");
+    /// A client bootstrapped through `broker` with its own retry options.
+    pub async fn client_with(
+        &self,
+        broker: usize,
+        connection: pulsar::ConnectionRetryOptions,
+        operation: pulsar::OperationRetryOptions,
+    ) -> Pulsar<TokioExecutor> {
+        Pulsar::builder(service_url(broker), TokioExecutor)
+            .with_connection_retry_options(connection)
+            .with_operation_retry_options(operation)
+            .build()
+            .await
+            .expect("connect to the cluster")
+    }
+
+    /// Lets subscriptions in `namespace` be only of `types`, or of any type
+    /// when `types` is empty. Creates the namespace if needed.
+    pub async fn allow_subscription_types(&self, namespace: &str, types: &[&str]) {
+        self.ensure_namespace(namespace).await;
+        let policy = format!("namespaces/{namespace}/subscriptionTypesEnabled");
+        if types.is_empty() {
+            self.admin(reqwest::Method::DELETE, &policy, None).await;
+        } else {
+            self.admin(
+                reqwest::Method::POST,
+                &policy,
+                Some(serde_json::json!(types)),
+            )
+            .await;
+        }
+    }
+
+    /// Moves `subscription` of `topic` back to the first message published
+    /// at or after `publish_time_ms`, as an operator would.
+    pub async fn reset_cursor(&self, topic: &str, subscription: &str, publish_time_ms: u64) {
+        self.admin(
+            reqwest::Method::POST,
+            &format!(
+                "{}/subscription/{subscription}/resetcursor/{publish_time_ms}",
+                path(topic)
+            ),
+            None,
+        )
+        .await;
+    }
+
+    /// Creates `namespace` if it is missing.
+    async fn ensure_namespace(&self, namespace: &str) {
+        let path = format!("admin/v2/namespaces/{namespace}");
         let created = self
             .web(reqwest::Method::PUT, &path, None)
             .await
@@ -432,6 +478,11 @@ impl Cluster {
             status.is_success() || status == reqwest::StatusCode::CONFLICT,
             "{path}: {status}"
         );
+    }
+
+    /// Creates [`STRICT_NAMESPACE`] if it is missing.
+    pub async fn ensure_strict_namespace(&self) {
+        self.ensure_namespace(STRICT_NAMESPACE).await;
         self.admin(
             reqwest::Method::POST,
             &format!("namespaces/{STRICT_NAMESPACE}/autoTopicCreation"),
@@ -569,6 +620,14 @@ impl Cluster {
         self.down[broker] = true;
         self.frozen[broker] = true;
         docker(&["pause", BROKERS[broker]]).await;
+    }
+
+    /// Lets a paused broker run on as it was, before its metadata session
+    /// expires, so it keeps its topics.
+    pub async fn resume_broker(&mut self, broker: usize) {
+        docker(&["unpause", BROKERS[broker]]).await;
+        self.frozen[broker] = false;
+        self.down[broker] = false;
     }
 
     pub async fn start_broker(&mut self, broker: usize) {

@@ -145,3 +145,25 @@ async fn a_producer_writes_to_partitions_added_while_it_runs() {
 async fn a_producer_of_a_one_partition_topic_grows_too() {
     grow_and_produce(1, "producer-grows-from-one").await;
 }
+
+// Partitions of one topic share connections; checking them all at once must
+// not have one ping cancel another's and break the connection.
+#[tokio::test]
+async fn a_partitioned_producer_checks_its_connections() {
+    let cluster = exclusive().await;
+    let topic = topic("producer-check");
+    cluster.create_partitioned_topic(&topic, 6).await;
+    let pulsar = cluster.client().await;
+    let producer = pulsar
+        .producer()
+        .with_topic(&topic)
+        .build()
+        .await
+        .expect("producer");
+    for _ in 0..5 {
+        producer
+            .check_connection()
+            .await
+            .expect("connections answer");
+    }
+}

@@ -60,7 +60,11 @@ pub(crate) enum Phase {
 // Java: PulsarClientException.isRetriableError, which a reconnect ignores
 // once subscribeFuture is done
 fn retriable_answer(kind: ServerError, phase: Phase) -> bool {
-    !is_permanent(kind)
+    let ends = match phase {
+        Phase::Create => is_permanent(kind),
+        Phase::Reconnect => ends_after_creation(kind),
+    };
+    !ends
         && (phase == Phase::Reconnect
             || !matches!(
                 kind,
@@ -74,18 +78,32 @@ fn retriable_answer(kind: ServerError, phase: Phase) -> bool {
             ))
 }
 
-/// Broker errors that no retry can fix, at creation or after it. An
+/// Broker errors that no retry can fix when creating a consumer or producer
+/// (see [`ends_after_creation`] for after). An
 /// authentication failure is not one, as in Java's isRetriableError: the
 /// auth provider may hand out a valid credential on the next attempt.
 pub(crate) fn is_permanent(kind: ServerError) -> bool {
+    ends_after_creation(kind)
+        || matches!(
+            kind,
+            ServerError::AuthorizationError
+                | ServerError::IncompatibleSchema
+                | ServerError::NotAllowedError
+                | ServerError::InvalidTopicName
+        )
+}
+
+/// Broker errors that end a consumer or producer that already exists. Java
+/// retries everything else once a consumer subscribed: an authorization or
+/// policy refusal can lift, and a broker answers AuthorizationError whenever
+/// its authorization check fails, a metadata timeout say.
+// Java: ConsumerImpl.connectionOpened (TopicDoesNotExistException) and
+// ProducerImpl.connectionOpened (ProducerFenced, TopicTerminated)
+pub(crate) fn ends_after_creation(kind: ServerError) -> bool {
     matches!(
         kind,
         ServerError::TopicNotFound
             | ServerError::TopicTerminatedError
-            | ServerError::AuthorizationError
-            | ServerError::IncompatibleSchema
-            | ServerError::NotAllowedError
-            | ServerError::InvalidTopicName
             | ServerError::ProducerFenced
     )
 }
@@ -130,10 +148,12 @@ impl Error {
     }
 
     /// Whether someone has to act for the client to get through: a credential
-    /// that the broker refused, or that the auth provider failed to make.
+    /// that the broker refused, or that the auth provider failed to make, or
+    /// a refusal by authorization or policy.
     pub(crate) fn needs_attention(&self) -> bool {
         self.connection_error()
             .is_some_and(ConnectionError::refuses_credential)
+            || self.server_error().is_some_and(is_permanent)
     }
 }
 

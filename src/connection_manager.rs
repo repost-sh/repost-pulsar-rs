@@ -231,8 +231,16 @@ enum ConnectionStatus<Exe: Executor> {
         conn: Arc<Connection<Exe>>,
         last_used: Instant,
     },
-    Connecting(Vec<oneshot::Sender<Result<Arc<Connection<Exe>>, ConnectionError>>>),
+    /// A connect under way, by the caller that took `token`; the waiters get
+    /// its outcome.
+    Connecting {
+        token: u64,
+        waiters: Vec<oneshot::Sender<Result<Arc<Connection<Exe>>, ConnectionError>>>,
+    },
 }
+
+/// Tells one connect's entry from another's.
+static CONNECT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Look up broker addresses for topics and partitioned topics
 ///
@@ -325,7 +333,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             proxy: false,
         };
         let retries = manager.connection_retry_options.max_retries;
-        manager.connect(broker_address, retries).await?;
+        manager
+            .get_connection_retrying(&broker_address, retries)
+            .await?;
         Ok(manager)
     }
 
@@ -372,42 +382,45 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         retries: u32,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         trace!("Looking for connection to {}...", broker.url);
-        let rx = {
+        // Under one lock: a valid connection, someone else's connect to wait
+        // for, or a connect of this caller's own.
+        let token = {
             let mut conns = self.connections.lock().await;
             match conns.get_mut(broker) {
-                None => {
-                    trace!("[] no connection for {}", broker.url);
-                    None
+                Some(ConnectionStatus::Connected { conn, last_used }) if conn.is_valid() => {
+                    trace!("[connected] returning valid connection for {}", broker.url);
+                    // Update last_used timestamp to prevent premature cleanup
+                    *last_used = Instant::now();
+                    return Ok(conn.clone());
                 }
-                Some(ConnectionStatus::Connected { conn, last_used }) => {
-                    if conn.is_valid() {
-                        trace!("[connected] returning valid connection for {}", broker.url);
-                        // Update last_used timestamp to prevent premature cleanup
-                        *last_used = Instant::now();
-                        return Ok(conn.clone());
-                    } else {
-                        warn!("[connected] invalid connection for {}", broker.url);
-                        None
-                    }
-                }
-                Some(ConnectionStatus::Connecting(ref mut v)) => {
-                    let (tx, rx) = oneshot::channel();
+                Some(ConnectionStatus::Connecting { waiters, .. }) => {
                     debug!(
                         "[connecting...] existing pending connection to {}",
                         broker.url
                     );
-                    v.push(tx);
-                    Some(rx)
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    Err(rx)
+                }
+                _ => {
+                    let token = CONNECT_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    conns.insert(
+                        broker.clone(),
+                        ConnectionStatus::Connecting {
+                            token,
+                            waiters: Vec::new(),
+                        },
+                    );
+                    Ok(token)
                 }
             }
         };
-
-        match rx {
-            None => {
+        match token {
+            Ok(token) => {
                 info!("No existing connection, creating new for {}", broker.url);
-                self.connect(broker.clone(), retries).await
+                self.connect(broker.clone(), retries, token).await
             }
-            Some(rx) => match rx.await {
+            Err(rx) => match rx.await {
                 Ok(res) => {
                     debug!("Connection found for {}", broker.url);
                     res
@@ -422,38 +435,12 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    /// Dials `broker`, up to `retries + 1` times.
     async fn connect_inner(
         &self,
         broker: &BrokerAddress,
         retries: u32,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
-        let rx = {
-            match self
-                .connections
-                .lock()
-                .await
-                .entry(broker.clone())
-                .or_insert_with(|| ConnectionStatus::Connecting(Vec::new()))
-            {
-                ConnectionStatus::Connecting(ref mut v) => {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        let (tx, rx) = oneshot::channel();
-                        v.push(tx);
-                        Some(rx)
-                    }
-                }
-                ConnectionStatus::Connected { .. } => None,
-            }
-        };
-        if let Some(rx) = rx {
-            return match rx.await {
-                Ok(res) => res,
-                Err(_) => Err(ConnectionError::Canceled),
-            };
-        }
-
         let proxy_url = if broker.proxy {
             Some(broker.broker_url.clone())
         } else {
@@ -525,7 +512,15 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         &self,
         broker: BrokerAddress,
         retries: u32,
+        token: u64,
     ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
+        let mut abandoned = Abandoned {
+            connections: self.connections.clone(),
+            broker: broker.clone(),
+            token,
+            executor: self.executor.clone(),
+            armed: true,
+        };
         let c = match self.connect_inner(&broker, retries).await {
             Err(e) => {
                 // the current ConnectionStatus is Connecting, containing
@@ -533,14 +528,19 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 // reconnection. If we delete this status, they will be
                 // notified that reconnection is canceled instead of getting
                 // stuck
-                if let Some(ConnectionStatus::Connecting(mut v)) =
-                    self.connections.lock().await.remove(&broker)
-                {
-                    // each waiter learns why, a refused credential say
-                    for tx in v.drain(..) {
-                        let _ = tx.send(Err(e.duplicate()));
+                let mut connections = self.connections.lock().await;
+                if is_connect(connections.get(&broker), token) {
+                    if let Some(ConnectionStatus::Connecting { waiters, .. }) =
+                        connections.remove(&broker)
+                    {
+                        // each waiter learns why, a refused credential say
+                        for tx in waiters {
+                            let _ = tx.send(Err(e.duplicate()));
+                        }
                     }
                 }
+                drop(connections);
+                abandoned.armed = false;
 
                 return Err(e);
             }
@@ -559,6 +559,10 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         let mut interval = self
             .executor
             .interval(self.connection_retry_options.keep_alive);
+        let ping_timeout = self
+            .connection_retry_options
+            .keep_alive
+            .min(self.operation_retry_options.operation_timeout);
         let broker_url = broker.url.clone();
         let proxy_to_broker_url = proxy_url.clone();
         let res = self.executor.spawn(Box::pin(async move {
@@ -588,7 +592,9 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 } else {
                     trace!("will ping connection {} to {}", connection_id, broker_url);
                 }
-                if let Err(e) = strong_conn.sender().send_ping().await {
+                // As Java's keepalive: a connection that does not answer
+                // within the interval is dead, a frozen broker's say.
+                if let Err(e) = strong_conn.sender().send_ping_within(ping_timeout).await {
                     error!(
                         "could not ping connection {} to the server at {}: {}",
                         connection_id, broker_url, e
@@ -608,10 +614,10 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 last_used: Instant::now(),
             },
         );
+        abandoned.armed = false;
         match old {
-            Some(ConnectionStatus::Connecting(mut v)) => {
-                //info!("was in connecting state({} waiting)", v.len());
-                for tx in v.drain(..) {
+            Some(ConnectionStatus::Connecting { waiters, .. }) => {
+                for tx in waiters {
                     let _ = tx.send(Ok(c.clone()));
                 }
             }
@@ -634,7 +640,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             .lock()
             .await
             .retain(|broker, ref mut connection| match connection {
-                ConnectionStatus::Connecting(_) => {
+                ConnectionStatus::Connecting { .. } => {
                     trace!("Retaining connection in `Connecting` state");
                     true
                 }
@@ -672,5 +678,40 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                     should_retain
                 }
             });
+    }
+}
+
+/// A connect dropped before it resolved its `Connecting` entry, by an
+/// application timeout say, would leave everyone waiting on that entry for
+/// ever. This takes the entry away instead; its waiters see the connect
+/// canceled, and try again.
+struct Abandoned<Exe: Executor> {
+    connections: Arc<Mutex<HashMap<BrokerAddress, ConnectionStatus<Exe>>>>,
+    broker: BrokerAddress,
+    /// The entry's: another connect's entry is not this one's to take.
+    token: u64,
+    executor: Arc<Exe>,
+    armed: bool,
+}
+
+/// Whether `status` is the entry of the connect that took `token`.
+fn is_connect<Exe: Executor>(status: Option<&ConnectionStatus<Exe>>, token: u64) -> bool {
+    matches!(status, Some(ConnectionStatus::Connecting { token: t, .. }) if *t == token)
+}
+
+impl<Exe: Executor> Drop for Abandoned<Exe> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let connections = self.connections.clone();
+        let broker = self.broker.clone();
+        let token = self.token;
+        let _ = self.executor.spawn(Box::pin(async move {
+            let mut connections = connections.lock().await;
+            if is_connect(connections.get(&broker), token) {
+                connections.remove(&broker);
+            }
+        }));
     }
 }

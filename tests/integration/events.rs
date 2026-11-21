@@ -154,7 +154,7 @@ async fn failover_consumers_hear_which_partitions_they_own() {
 }
 
 #[tokio::test]
-async fn a_seek_ends_ownership_until_the_broker_confirms_it() {
+async fn a_seek_keeps_ownership_the_broker_keeps() {
     let cluster = exclusive().await;
     let topic = topic("events-seek");
     cluster.create_partitioned_topic(&topic, 2).await;
@@ -164,16 +164,46 @@ async fn a_seek_ends_ownership_until_the_broker_confirms_it() {
     let mut consumer = failover_consumer(&pulsar, &topic, "a").await;
     let taken = take(&mut consumer, &mut Delivered::default(), 3).await;
 
-    // The broker reconnects every consumer of the partition when it seeks,
-    // and another one may receive it meanwhile.
+    // The broker reconnects the active consumer when it seeks; alone, this
+    // one gets the partition back, and hears nothing it did not already know.
     consumer
         .seek_to(&first, taken[0].message_id().clone())
         .await
         .expect("seek");
 
     let seen = gather(&mut consumer, |s| messages(s, &first) == [2, 3]).await;
-    assert_eq!(events(&seen, &first), [false, true], "{seen:?}");
-    assert!(active_before_messages(&seen, &first), "{seen:?}");
+    assert_eq!(events(&seen, &first), Vec::<bool>::new(), "{seen:?}");
+}
+
+// A consumer that seeks whenever it gets a partition, as an indexer seeking
+// to its checkpoint does, must not hear of the partition again for its own
+// seek, or it seeks for ever.
+#[tokio::test]
+async fn a_consumer_that_seeks_on_activation_settles() {
+    let cluster = exclusive().await;
+    let topic = topic("events-seek-loop");
+    cluster.create_partitioned_topic(&topic, 2).await;
+    let first = partition(&topic, 0);
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &first, 1..=3).await;
+    let mut consumer = failover_consumer(&pulsar, &topic, "a").await;
+    let taken = take(&mut consumer, &mut Delivered::default(), 3).await;
+    let checkpoint = taken[0].message_id().clone();
+    consumer
+        .seek_to(&first, checkpoint.clone())
+        .await
+        .expect("seek");
+
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < until {
+        let item = tokio::time::timeout(Duration::from_secs(1), consumer.next_item()).await;
+        if let Ok(Some(Ok(ConsumerItem::Event(ConsumerEvent::BecameActive { topic })))) = item {
+            assert_ne!(
+                topic, first,
+                "the consumer got its partition back: it would seek again"
+            );
+        }
+    }
 }
 
 #[tokio::test]

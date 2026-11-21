@@ -16,12 +16,16 @@ use crate::{
 pub enum ConsumerEvent {
     /// This consumer receives `topic` from now on, a partition name such as
     /// `persistent://public/default/orders-partition-3`. The broker restarts
-    /// it at the last acknowledged message, so this needs no seek: a seek
-    /// reconnects the consumer, which ends the activation and starts a new one.
+    /// it at the last acknowledged message, so this needs no seek; skip what
+    /// was already processed instead. A seek disconnects the active consumer:
+    /// its own seek leaves this one active, without a new event, unless the
+    /// broker gives the partition to another consumer meanwhile. Consumers of
+    /// a group that each seek on every BecameActive can hand a partition back
+    /// and forth.
     BecameActive { topic: String },
     /// This consumer may no longer be the one that receives `topic`: the
-    /// broker moved it to another consumer, or the consumer reconnected,
-    /// after a seek too. Messages of `topic` handed over before this event may
+    /// broker moved it to another consumer, or the consumer reconnected for
+    /// a reason other than its own seek. Messages of `topic` handed over before this event may
     /// be redelivered elsewhere.
     BecameInactive { topic: String },
 }

@@ -230,3 +230,28 @@ async fn acking_members_of_a_batch_by_id_holds_across_a_restart() {
     collect(&mut second, &mut delivered, 7, DEADLINE).await;
     delivered.assert_exactly(&topic, 1..=7);
 }
+
+// A cumulative ack by the id a message reports, without its batch size, must
+// not ack the members after it.
+#[tokio::test]
+async fn a_cumulative_ack_by_message_id_inside_a_batch_holds_across_a_restart() {
+    let cluster = exclusive().await;
+    let topic = topic("batch-cumulative-by-id");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish_batched(&pulsar, &topic, 1..=10).await;
+
+    let mut first = earliest_consumer(&pulsar, &topic, "batched").await;
+    let taken = take(&mut first, &mut Delivered::default(), 10).await;
+    first
+        .cumulative_ack_with_id(&topic, taken[3].message_id().clone())
+        .await
+        .expect("ack");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    drop(first);
+
+    let mut second = earliest_consumer(&pulsar, &topic, "batched").await;
+    let mut delivered = Delivered::default();
+    collect(&mut second, &mut delivered, 6, DEADLINE).await;
+    delivered.assert_exactly(&topic, 5..=10);
+}

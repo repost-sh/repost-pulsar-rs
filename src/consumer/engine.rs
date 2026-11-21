@@ -55,6 +55,11 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// When the first subscribe succeeded, which the configured rollback
     /// counts from.
     subscribed_at: Instant,
+    /// After a rollback to a seek's publish time, which the protocol rounds
+    /// to whole seconds: messages published before it are dropped, until the
+    /// first one at or after it.
+    // Java: the broker alone seeks by time; this keeps a reconnect as exact
+    time_floor: Option<u64>,
     /// Seeks that came while the consumer was reconnecting, to make once it
     /// is back.
     deferred_seeks: VecDeque<(Seek, Instant, SeekReply)>,
@@ -71,6 +76,9 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Members acked so far of batch entries not yet acked as a whole, by
     /// (ledger, entry).
     batch_acks: BTreeMap<(u64, u64), BatchAcks>,
+    /// The size of each batch entry a durable subscription delivered and has
+    /// not acked whole, for acks by an id that lacks it.
+    batch_sizes: BTreeMap<(u64, u64), i32>,
     /// Permits of the frame being processed that are accounted for, by a
     /// delivery or a refund, so a failure refunds only the rest.
     frame_accounted: u32,
@@ -120,6 +128,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             start,
             subscribed_at: Instant::now(),
             deferred_seeks: VecDeque::new(),
+            time_floor: None,
             first_queued_known,
             engine_rx: Some(engine_rx),
             event_rx,
@@ -128,6 +137,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             unacked_message_redelivery_delay,
             unacked_messages: HashMap::new(),
             batch_acks: BTreeMap::new(),
+            batch_sizes: BTreeMap::new(),
             frame_accounted: 0,
             dead_letter_policy,
             options,
@@ -349,14 +359,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let key = (id.ledger_id, id.entry_id);
         if cumulative {
             // entries before this one are covered; this one keeps its marks
-            while let Some(entry) = self.batch_acks.first_entry() {
-                if *entry.key() >= key {
-                    break;
-                }
-                entry.remove();
-            }
+            self.batch_acks = self.batch_acks.split_off(&key);
+            self.batch_sizes = self.batch_sizes.split_off(&key);
         }
-        let (Some(index), Some(size)) = (id.batch_index, id.batch_size) else {
+        // An id from Message::message_id has no batch size; acking its entry
+        // whole would ack members not taken yet.
+        let size = id
+            .batch_size
+            .or_else(|| self.batch_sizes.get(&key).copied());
+        let (Some(index), Some(size)) = (id.batch_index, size) else {
             return Some(id);
         };
         let acks = batch_acks_of(&mut self.batch_acks, key, size);
@@ -367,6 +378,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
         if acks.is_complete() {
             self.batch_acks.remove(&key);
+            self.batch_sizes.remove(&key);
             return Some(whole_entry(id));
         }
         if self.options.batch_index_ack != Some(false) {
@@ -579,11 +591,26 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         } else {
             vec![(message.message_id, payload)]
         };
+        if let Some(size) = batch_size.filter(|_| self.options.durable != Some(false)) {
+            // bounded: a consumer that never acks keeps the newest
+            if self.batch_sizes.len() >= MAX_BATCH_SIZES {
+                self.batch_sizes.pop_first();
+            }
+            self.batch_sizes.insert(entry, size);
+        }
         let acked_before = !message.ack_set.is_empty();
         if let Some(size) = batch_size.filter(|_| acked_before) {
             batch_acks_of(&mut self.batch_acks, entry, size).keep_only(&message.ack_set);
         }
         for (message_id, payload) in payloads {
+            if let Some(floor) = self.time_floor {
+                if payload.metadata.publish_time < floor {
+                    debug!("consumer engine: dropped {message_id:?}, published before the seek");
+                    self.refund_permit().await;
+                    continue;
+                }
+                self.time_floor = None;
+            }
             // The broker charged no permit for a member it reports acked.
             if acked_before
                 && message_id
@@ -710,6 +737,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     // Java: pulsar-client/.../impl/ConsumerImpl.java:1035 clearReceiverQueue on reconnect
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn reconnect(&mut self) -> Result<(), Error> {
+        self.reconnect_announcing(true).await
+    }
+
+    /// `announce`: tell a Failover application it may have lost the
+    /// partition. Not after its own seek: the broker hands the partition back
+    /// unless another consumer has it, and says so either way, while a
+    /// BecameInactive would make an application that seeks on activation
+    /// seek for ever.
+    async fn reconnect_announcing(&mut self, announce: bool) -> Result<(), Error> {
         debug!("reconnecting consumer for topic: {}", self.topic);
         let (mut options, rollback) = {
             let mut delivery = self.delivery.lock().unwrap();
@@ -744,12 +780,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     ),
                     // The broker keeps the subscription across its own seek;
                     // a later reconnect may find it gone.
-                    Resume::Time(publish_time_ms) => (
-                        None,
-                        None,
-                        seek.is_none()
-                            .then_some(Rollback::ToPublishTime(*publish_time_ms)),
-                    ),
+                    // Newer brokers retire a non-durable subscription on its own
+                    // seek, so the rollback goes again; the floor drops what its
+                    // rounding to whole seconds lets in.
+                    Resume::Time(publish_time_ms) => {
+                        self.time_floor = Some(*publish_time_ms);
+                        (None, None, Some(Rollback::ToPublishTime(*publish_time_ms)))
+                    }
                     Resume::From(id) | Resume::After(id) => {
                         (Some(id.clone()), start_filter(&delivery.resume), None)
                     }
@@ -763,23 +800,36 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             self.first_queued_known = matches!(delivery.resume, Resume::From(_) | Resume::After(_));
             (options, rollback)
         };
-        // Another consumer may receive the partition until this one is back,
-        // even after a seek, since the broker reconnects every consumer of the
-        // partition; the broker says so again if it is still ours.
-        let _ = self.announce(false);
+        // Another consumer may receive the partition until this one is back;
+        // the broker says so again if it is still ours.
+        if announce {
+            let _ = self.announce(false);
+        }
         self.unacked_messages.clear();
         // Java ties batch ack state to the delivered ids, which a reconnect
         // delivers anew.
         self.batch_acks.clear();
+        self.batch_sizes.clear();
 
-        // send CloseConsumer to server
-        // remove our resolver from the Connection consumers BTreeMap,
-        // stopping the current Message source
-        if let Err(e) = self.connection.sender().close_consumer(self.id).await {
-            error!(
-                "could not close consumer {:?}({}) for topic {}: {:?}",
-                self.name, self.id, self.topic, e
-            );
+        // Close the consumer on the old connection, without waiting on a broken
+        // one: a frozen broker would hold the close for the whole operation
+        // timeout, and frames from it are stale by their epoch anyway.
+        if self.connection.is_valid() {
+            if let Err(e) = self.connection.sender().close_consumer(self.id).await {
+                error!(
+                    "could not close consumer {:?}({}) for topic {}: {:?}",
+                    self.name, self.id, self.topic, e
+                );
+            }
+        } else {
+            // A ping timeout may have flagged a stalled socket that still
+            // works: the broker should drop the old consumer, or an Exclusive
+            // one would refuse the new subscription as busy.
+            let connection = self.connection.clone();
+            let id = self.id;
+            let _ = self.client.executor.spawn(Box::pin(async move {
+                let _ = connection.sender().close_consumer(id).await;
+            }));
         }
 
         let mut acks = Vec::new();
@@ -840,9 +890,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         }
                     }
                 }
-                // Java retries everything but a deleted topic; errors that no
-                // retry can fix (permissions, schema) are reported here too.
-                Err(e) if e.server_error().is_some_and(error::is_permanent) => {
+                // Java retries everything but a deleted topic.
+                Err(e) if e.server_error().is_some_and(error::ends_after_creation) => {
                     error!(
                         "consumer {}: cannot subscribe again: {e}",
                         self.debug_format()
@@ -861,9 +910,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                         "consumer {}: reconnect failed, retrying in {delay:?}: {e}",
                         self.debug_format()
                     );
-                    // A refused credential needs someone to act: the application
-                    // hears it once an outage, and the consumer keeps trying
-                    // with whatever the provider hands out next.
+                    // A refused credential, or a refusal by authorization or
+                    // policy, needs someone to act: the application hears it
+                    // once an outage, and the consumer keeps trying.
                     if !reported && e.needs_attention() {
                         reported = true;
                         let _ = self.deliver(Err(e));
@@ -1113,7 +1162,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 Ok(_) => {
                     // the broker moved, and closed the consumer
                     self.delivery.lock().unwrap().pending_seek = Some(seek);
-                    self.reconnect().await?;
+                    self.reconnect_announcing(false).await?;
                     return Ok(Ok(()));
                 }
                 Err(e) => e,
@@ -1381,22 +1430,16 @@ impl Rollback {
     }
 }
 
-/// Whether `id` was already delivered when the subscription restarts from
-/// `start`. The broker resends the whole entry `start` is in, so for a batch
-/// the earlier members of that entry are dropped too.
-// C++: lib/ConsumerImpl.cc:793 messageReceived, prior-entry check
+/// Whether `id` is the start message or comes before it in the start's own
+/// entry, which the broker sends whole. Other entries are not the filter's:
+/// an operator may move a cursor back after a seek, and the broker sends what
+/// it means to.
+// Java: ConsumerImpl.isSameEntry and isPriorBatchIndex
 // C++: lib/ConsumerImpl.cc:971 receiveIndividualMessagesFromBatch, prior-batch-index check
 fn is_at_or_before(id: &MessageIdData, start: &MessageIdData) -> bool {
-    if id.ledger_id != start.ledger_id {
-        return false;
-    }
-    match id.batch_index {
-        Some(index) => {
-            id.entry_id < start.entry_id
-                || (id.entry_id == start.entry_id && index <= start.batch_index.unwrap_or(-1))
-        }
-        None => id.entry_id <= start.entry_id,
-    }
+    id.ledger_id == start.ledger_id
+        && id.entry_id == start.entry_id
+        && id.batch_index.unwrap_or(-1) <= start.batch_index.unwrap_or(-1)
 }
 
 /// Where a non-durable subscription configured to start at a message id
@@ -1432,6 +1475,9 @@ fn before_in_entry(first: &MessageIdData) -> Option<MessageIdData> {
         ..first.clone()
     })
 }
+
+/// How many batch sizes a durable subscription keeps for acks by id.
+const MAX_BATCH_SIZES: usize = 10_000;
 
 /// The error of a seek that waited for a reconnect past its time.
 fn seek_timed_out() -> Error {
@@ -1483,5 +1529,36 @@ mod rollback_tests {
             let now = Duration::from_millis(sought) + Duration::from_secs(late);
             assert_eq!(rollback.at(Instant::now(), now), Duration::from_secs(late));
         }
+    }
+}
+
+#[cfg(test)]
+mod start_filter_tests {
+    use super::is_at_or_before;
+    use crate::message::proto::MessageIdData;
+
+    fn id(entry_id: u64, batch_index: Option<i32>) -> MessageIdData {
+        MessageIdData {
+            ledger_id: 1,
+            entry_id,
+            batch_index,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_the_start_entry_up_to_the_start_is_dropped() {
+        // a batch member: the members up to it
+        let start = id(5, Some(2));
+        assert!(is_at_or_before(&id(5, Some(0)), &start));
+        assert!(is_at_or_before(&id(5, Some(2)), &start));
+        assert!(!is_at_or_before(&id(5, Some(3)), &start));
+        // other entries, earlier ones too, are not the filter's
+        assert!(!is_at_or_before(&id(4, Some(9)), &start));
+        assert!(!is_at_or_before(&id(4, None), &start));
+        // a whole entry: that entry's message, but no member of a batch there
+        let start = id(5, None);
+        assert!(is_at_or_before(&id(5, None), &start));
+        assert!(!is_at_or_before(&id(5, Some(0)), &start));
     }
 }
