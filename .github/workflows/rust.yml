@@ -25,10 +25,10 @@ jobs:
         run: cargo build --features protobuf-src
 
       - name: Clippy (feature set A)
-        run: cargo clippy --tests --features telemetry,protobuf-src,admin-api -- -D warnings
+        run: cargo clippy --tests --features telemetry,protobuf-src,admin-api,cluster-tests -- -D warnings
 
       - name: Clippy (feature set B)
-        run: cargo clippy --tests --no-default-features --features compression,tokio-rustls-runtime,async-std-rustls-runtime,auth-oauth2,telemetry,protobuf-src -- -D warnings
+        run: cargo clippy --tests --no-default-features --features compression,tokio-rustls-runtime,async-std-rustls-runtime,auth-oauth2,telemetry,protobuf-src,cluster-tests -- -D warnings
 
       - name: Check format
         run: cargo fmt --all --check
@@ -102,3 +102,34 @@ jobs:
         if: always()
         run: docker rm -f pulsar || true
 
+  # The fault-injection suite: a two-broker cluster, a bookie, ZooKeeper and a
+  # JWT broker, which the harness starts with docker (tests/integration/cluster.rs).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pull the Pulsar image
+        run: docker pull apachepulsar/pulsar:5.0.1
+
+      - name: Run the integration suite
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo test --features protobuf-src,cluster-tests --test integration
+
+      - name: Dump the cluster's logs on failure
+        if: failure()
+        run: |
+          for name in $(docker ps -a --filter label=rprs.cluster=test --format '{{.Names}}'); do
+            echo "==== $name ===="
+            docker logs --tail=300 "$name" || true
+          done
+
+      - name: Remove the cluster
+        if: always()
+        run: |
+          docker rm -f $(docker ps -aq --filter label=rprs.cluster=test) || true
+          docker network rm rprs-test || true
