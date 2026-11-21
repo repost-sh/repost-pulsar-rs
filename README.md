@@ -22,7 +22,7 @@ Add the following dependencies in your `Cargo.toml`:
 
 ```toml
 futures = "0.3"
-pulsar = "6.3.1"
+pulsar = "7.0.0"
 tokio = "1.0"
 ```
 
