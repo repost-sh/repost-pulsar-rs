@@ -1,9 +1,18 @@
 # Changelog
 
-## Unreleased
+## 7.1.0
 
 ### Consumer
 
+- Failover consumers that each seek a partition to their own checkpoint on
+  `BecameActive` settle, when each has its own name. In 72 of 72 runs on
+  Pulsar 5.0.1, with three consumers, four partitions and one membership
+  change at a time, ownership reached the broker's layout about a second
+  after each change and no further event came for 10 s. This replaces the
+  7.0.0 advice against seeking on activation. Each such seek stalls the
+  partition for the broker's failover delay. Around a change of owner the
+  broker can deliver a message ahead of the last acknowledged one; the
+  `BecameActive` docs say how an application detects it.
 - `Consumer::seek_to_inclusive(topic, id)` and `Reader::seek_to_inclusive`
   restart a topic or partition at `id`, where `seek_to` restarts after it.
   The next message is `id` itself, and the members of its batch before it
@@ -107,7 +116,7 @@ Upgrading needs code changes, and some behaviour changes without one:
   `BecameInactive` per partition, through `Consumer::next_item`. A
   consumer's own seek tells it nothing new unless the broker gives the
   partition to another consumer meanwhile; don't seek on every activation,
-  as a group of consumers doing so can hand a partition back and forth.
+  as a group of consumers doing so can hand a partition back and forth. (Withdrawn in 7.1.0.)
 - Partitioned readers, `ConsumerOptions::with_start_rollback`, and
   `has_message_available` on consumers and readers.
 - Partitions added to a topic are found while the consumer runs.

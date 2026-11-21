@@ -16,12 +16,22 @@ use crate::{
 pub enum ConsumerEvent {
     /// This consumer receives `topic` from now on, a partition name such as
     /// `persistent://public/default/orders-partition-3`. The broker restarts
-    /// it at the last acknowledged message, so this needs no seek; skip what
-    /// was already processed instead. A seek disconnects the active consumer:
-    /// its own seek leaves this one active, without a new event, unless the
-    /// broker gives the partition to another consumer meanwhile. Consumers of
-    /// a group that each seek on every BecameActive can hand a partition back
-    /// and forth.
+    /// it at the last acknowledged message.
+    ///
+    /// An application that keeps its own checkpoint can seek the partition
+    /// to it on this event, if each consumer of the subscription has its own
+    /// name: a seek closes only the active consumer, and the broker picks
+    /// the owner by name order, so the seeker stays active with no new
+    /// event, unless the broker gives the partition to another consumer
+    /// meanwhile. Equal names are untested. Each such seek stalls the
+    /// partition for the broker's failover delay
+    /// (`activeConsumerFailoverDelayTimeMillis`, 1 s by default).
+    ///
+    /// Around a change of owner the broker can deliver a message ahead of
+    /// the last acknowledged one, before this event or right after a seek.
+    /// An application that must not skip messages checks that each message
+    /// follows the one it processed before, and seeks again when one does
+    /// not. `tests/integration/failover_seek.rs` shows both.
     BecameActive { topic: String },
     /// This consumer may no longer be the one that receives `topic`: the
     /// broker moved it to another consumer, or the consumer reconnected for
