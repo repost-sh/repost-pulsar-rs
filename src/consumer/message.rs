@@ -18,25 +18,58 @@ pub enum ConsumerEvent {
     /// `persistent://public/default/orders-partition-3`. The broker restarts
     /// it at the last acknowledged message.
     ///
+    /// What an application can rely on: on a durable subscription of a
+    /// persistent topic, every message of `topic` comes after this event.
+    /// Before the broker dispatches to a new owner, it rewinds to the last
+    /// acknowledged message and tells the consumers which of them is
+    /// active. The client drops what the broker
+    /// sends a consumer before it has told it so since the consumer last
+    /// subscribed, and the broker sends that again once it does. Every
+    /// re-subscribe, the consumer's own seek included, starts over, so after
+    /// a [`ConsumerEvent::BecameInactive`] no message comes until the next
+    /// `BecameActive`. [`crate::Consumer::messages_withheld`] counts what the
+    /// client dropped. Other subscription types, readers, non-persistent
+    /// topics and brokers before protocol version 12 get every message the
+    /// broker sends, as before.
+    ///
     /// An application that keeps its own checkpoint can seek the partition
     /// to it on this event, if each consumer of the subscription has its own
     /// name: a seek closes only the active consumer, and the broker picks
     /// the owner by name order, so the seeker stays active with no new
     /// event, unless the broker gives the partition to another consumer
-    /// meanwhile. Equal names are untested. Each such seek stalls the
-    /// partition for the broker's failover delay
+    /// meanwhile. Equal names are untested. After such a seek the partition
+    /// resumes once the broker has said again that this consumer is active,
+    /// about its failover delay later
     /// (`activeConsumerFailoverDelayTimeMillis`, 1 s by default).
     ///
-    /// Around a change of owner the broker can deliver a message ahead of
-    /// the last acknowledged one, before this event or right after a seek.
-    /// An application that must not skip messages checks that each message
-    /// follows the one it processed before, and seeks again when one does
-    /// not. `tests/integration/failover_seek.rs` shows both.
+    /// What it must still check: two cases remain in which the broker
+    /// delivers a message ahead of the last acknowledged one and the client
+    /// cannot tell. A consumer that stays connected while its partition goes
+    /// to another consumer and back within the failover delay hears nothing
+    /// until the delay ends.
+    /// What the broker sends it meanwhile can start past the entries it sent
+    /// the other consumer. When the broker then says a second time that the
+    /// consumer is active, the application gets a `BecameInactive` and this
+    /// event again, if it was handed a message in between: those messages
+    /// come again, and may have skipped some. The other case is a read the
+    /// broker started for this consumer before it told it, and that was
+    /// still under way when the broker rewound: its entries arrive after
+    /// this event, and the broker goes on from the last of them, so the
+    /// messages between the last acknowledged one and them come only after
+    /// the next rewind, such as a seek. An application that must not skip
+    /// messages therefore still checks that each message follows the one it
+    /// processed before, and seeks again when one does not, as
+    /// `tests/integration/failover_seek.rs` does. The first message after a
+    /// seek to the start of a partition has nothing before it to check
+    /// against: it is the partition's first message unless that read was
+    /// under way, which `tests/integration/failover_start.rs` tests.
     BecameActive { topic: String },
     /// This consumer may no longer be the one that receives `topic`: the
-    /// broker moved it to another consumer, or the consumer reconnected for
-    /// a reason other than its own seek. Messages of `topic` handed over before this event may
-    /// be redelivered elsewhere.
+    /// broker moved it to another consumer, the consumer reconnected for a
+    /// reason other than its own seek, or the broker restarted the
+    /// partition at the last acknowledged message for a consumer that was
+    /// active already. Messages of `topic` handed over before this event
+    /// may be redelivered, here or elsewhere.
     BecameInactive { topic: String },
 }
 

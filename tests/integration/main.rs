@@ -18,6 +18,7 @@ mod cluster;
 mod delivery;
 mod events;
 mod failover_seek;
+mod failover_start;
 mod partitions;
 mod producer;
 mod reader;

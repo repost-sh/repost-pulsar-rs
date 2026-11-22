@@ -120,6 +120,7 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(super) config: ConsumerConfig,
     // Stats on disconnected consumers to keep metrics correct
     pub(super) disc_messages_received: u64,
+    pub(super) disc_messages_withheld: u64,
     pub(super) disc_last_message_received: Option<DateTime<Utc>>,
     /// Events for partitions dropped after an error: the application saw
     /// them active, and nothing will say otherwise now.
@@ -153,6 +154,16 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
             .values()
             .map(|c| c.messages_received)
             .chain(iter::once(self.disc_messages_received))
+            .sum()
+    }
+
+    /// See [`crate::Consumer::messages_withheld`].
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn messages_withheld(&self) -> u64 {
+        self.consumers
+            .values()
+            .map(|c| c.messages_withheld())
+            .chain(iter::once(self.disc_messages_withheld))
             .sum()
     }
 
@@ -228,6 +239,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
                         });
                 }
                 self.disc_messages_received += consumer.messages_received;
+                self.disc_messages_withheld += consumer.messages_withheld();
                 self.disc_last_message_received = self
                     .disc_last_message_received
                     .into_iter()

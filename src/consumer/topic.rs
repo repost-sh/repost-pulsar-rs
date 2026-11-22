@@ -327,6 +327,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         self.messages_received
     }
 
+    /// See [`crate::Consumer::messages_withheld`].
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn messages_withheld(&self) -> u64 {
+        self.delivery.lock().unwrap().withheld
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn config(&self) -> &ConsumerConfig {
         &self.config

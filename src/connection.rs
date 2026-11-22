@@ -383,6 +383,8 @@ pub struct ConnectionSender<Exe: Executor> {
     executor: Arc<Exe>,
     operation_timeout: Duration,
     closed_producers: ClosedProducers,
+    /// The protocol version the broker answered the connect with.
+    protocol_version: i32,
 }
 
 impl<Exe: Executor> ConnectionSender<Exe> {
@@ -398,6 +400,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         executor: Arc<Exe>,
         operation_timeout: Duration,
         closed_producers: ClosedProducers,
+        protocol_version: i32,
     ) -> ConnectionSender<Exe> {
         ConnectionSender {
             connection_id,
@@ -410,7 +413,13 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             executor,
             operation_timeout,
             closed_producers,
+            protocol_version,
         }
+    }
+
+    /// The protocol version the broker speaks on this connection.
+    pub(crate) fn protocol_version(&self) -> i32 {
+        self.protocol_version
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -1334,7 +1343,7 @@ impl<Exe: Executor> Connection<Exe> {
             .await?;
 
         let msg = stream.next().await;
-        match msg {
+        let connected = match msg {
             Some(Ok(Message {
                 command:
                     proto::BaseCommand {
@@ -1456,6 +1465,7 @@ impl<Exe: Executor> Connection<Exe> {
             executor.clone(),
             operation_timeout,
             closed_producers,
+            connected.protocol_version.unwrap_or_default(),
         );
 
         Ok(sender)

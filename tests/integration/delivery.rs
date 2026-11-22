@@ -1,7 +1,12 @@
 //! Publishes numbered messages and checks what a consumer delivered: nothing
 //! lost, nothing twice, and in order, per topic or partition.
 
-use std::{collections::BTreeMap, ops::RangeInclusive, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    ops::RangeInclusive,
+    time::Duration,
+};
 
 /// Long enough for a broker to fail over and a consumer to reconnect.
 pub const DEADLINE: Duration = Duration::from_secs(90);
@@ -13,6 +18,9 @@ use pulsar::{
     reader::Reader,
     Consumer, ConsumerOptions, Error, Producer, Pulsar, SubType, TokioExecutor,
 };
+use tokio::{sync::oneshot, task::JoinHandle};
+
+use crate::cluster::within;
 
 /// An Exclusive, durable consumer that starts at the earliest message.
 pub async fn earliest_consumer(
@@ -40,6 +48,49 @@ pub async fn failover_consumer(
         .build()
         .await
         .expect("consumer")
+}
+
+/// A consumer of a Failover group, driven by a task of its own until it is
+/// told to stop.
+pub struct Member {
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl Member {
+    /// Spawns the task `drive` makes, which ends once the receiver it gets
+    /// fires.
+    pub fn spawn<F>(drive: impl FnOnce(oneshot::Receiver<()>) -> F) -> Member
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(drive(stopped));
+        Member { stop, task }
+    }
+
+    /// Tells the task of the consumer `name` to stop, and waits for it.
+    pub async fn stop(self, name: &str) {
+        self.stop.send(()).expect("the consumer task runs");
+        within(DEADLINE, format!("{name}: stop"), self.task)
+            .await
+            .expect("the consumer task");
+    }
+}
+
+/// The consumer the broker makes active on each of `partitions`: among
+/// `names`, in name order, the one at the partition's index modulo their
+/// number.
+pub fn expected_owners(
+    partitions: &[String],
+    names: &[&'static str],
+) -> BTreeMap<String, BTreeSet<&'static str>> {
+    assert!(names.is_sorted(), "{names:?} in name order");
+    partitions
+        .iter()
+        .enumerate()
+        .map(|(i, partition)| (partition.clone(), BTreeSet::from([names[i % names.len()]])))
+        .collect()
 }
 
 /// [`earliest_consumer`] with other options as well.
@@ -108,12 +159,7 @@ pub async fn publish_around_a_time(
 }
 
 pub async fn publish(pulsar: &Pulsar<TokioExecutor>, topic: &str, numbers: RangeInclusive<u64>) {
-    let mut producer = pulsar
-        .producer()
-        .with_topic(topic)
-        .build()
-        .await
-        .expect("producer");
+    let mut producer = producer(pulsar, topic).await;
     for number in numbers {
         producer
             .send_non_blocking(number.to_string())
@@ -122,6 +168,16 @@ pub async fn publish(pulsar: &Pulsar<TokioExecutor>, topic: &str, numbers: Range
             .await
             .expect("receipt");
     }
+}
+
+/// A producer that sends each message as an entry of its own.
+pub async fn producer(pulsar: &Pulsar<TokioExecutor>, topic: &str) -> Producer<TokioExecutor> {
+    pulsar
+        .producer()
+        .with_topic(topic)
+        .build()
+        .await
+        .expect("producer")
 }
 
 /// Publishes `numbers` in batches of ten, one broker entry per batch.

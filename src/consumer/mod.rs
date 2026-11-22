@@ -5,6 +5,16 @@ pub mod builder;
 pub mod config;
 pub mod data;
 mod engine;
+mod gate;
+#[cfg(all(
+    test,
+    any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    )
+))]
+mod gate_tests;
 pub(crate) mod initial_position;
 pub mod message;
 mod multi;
@@ -193,6 +203,13 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     /// buffered from before the seek are not delivered. Every other topic keeps
     /// its position and its buffered messages.
     ///
+    /// On a durable Failover subscription of a persistent topic, the next
+    /// message arrives once the broker has said again that this consumer is
+    /// the active one, about its failover delay after the seek
+    /// (`activeConsumerFailoverDelayTimeMillis`, 1 s by default), with no
+    /// event. What the broker sends before that is dropped.
+    /// [`ConsumerEvent::BecameActive`] says what can still come out of turn.
+    ///
     /// `topic` names the topic the id belongs to: for a partitioned topic, the
     /// partition, such as `persistent://public/default/orders-partition-3`,
     /// which is what [`Message::topic`] holds. Short names like `orders` mean
@@ -209,7 +226,13 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     /// Restarts `topic` at `message_id`: the next message from that topic or
     /// partition is `message_id` itself. When `message_id` is a member of a
     /// batch, this seek does not deliver the members before it. In everything
-    /// else this is [`Consumer::seek_to`], which says how to name `topic`.
+    /// else this is [`Consumer::seek_to`], which says how to name `topic` and
+    /// when a Failover subscription resumes.
+    ///
+    /// With the earliest id, ledger and entry `u64::MAX`, the seek restarts
+    /// `topic` at the first message it holds, which on a durable Failover
+    /// subscription of a persistent topic is then the next message, except in
+    /// the cases [`ConsumerEvent::BecameActive`] names.
     ///
     /// When the broker no longer holds `message_id`, because its ledger was
     /// deleted, the seek still succeeds. The next message is then the first
@@ -479,6 +502,18 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         match &self.inner {
             InnerConsumer::Single(c) => c.messages_received(),
             InnerConsumer::Multi(c) => c.messages_received(),
+        }
+    }
+
+    /// How many messages of a Failover subscription the client received and
+    /// did not hand over, because the broker had not said this consumer was
+    /// the active one of their topic or partition. The broker sends them
+    /// again from the subscription's position once it does.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn messages_withheld(&self) -> u64 {
+        match &self.inner {
+            InnerConsumer::Single(c) => c.messages_withheld(),
+            InnerConsumer::Multi(c) => c.messages_withheld(),
         }
     }
 

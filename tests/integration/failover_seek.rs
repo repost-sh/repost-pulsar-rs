@@ -4,31 +4,45 @@
 //!
 //! The client guarantee under test is that `seek_to`, with `BecameActive`
 //! and `BecameInactive`, lets an application restart each partition at its
-//! own checkpoint, settle, and recover from an entry the broker delivers
-//! ahead of that checkpoint. Settling is not a given. A seek closes the
-//! partition's active consumer, and if the broker gave the partition to
-//! another consumer meanwhile, that one would seek in turn, and the
-//! partition would move for ever.
+//! own checkpoint, settle, and miss nothing. Settling is not a given. A
+//! seek closes the partition's active consumer, and if the broker gave the
+//! partition to another consumer meanwhile, that one would seek in turn,
+//! and the partition would move for ever.
 //!
-//! In apache/pulsar `v5.0.1` the broker sends such an entry on two paths.
-//! A seek disconnects only the active consumer and does not cancel the
-//! dispatcher's read in flight (`PersistentSubscription.java:994`). That
-//! read then writes its next position over the reset one
-//! (`OpReadEntry.java:249-251`), and the dispatcher sends the stale entry
-//! (`PersistentDispatcherSingleActiveConsumer.java:224-246`). When the
-//! active consumer leaves, Failover holds back the rewind and the new
-//! owner's `BecameActive` for a second (same file, `:139-152`). A send to
-//! the old owner that completes meanwhile starts a read for the new one,
-//! past the entries the old one was sent (`:265`), because only a flow
-//! request waits for the rewind (`:284`).
+//! Missing nothing is not a given either. In apache/pulsar `v5.0.1` the
+//! broker sends a consumer entries ahead of the checkpoint on two paths. A
+//! seek closes the active consumer without picking another one, and the
+//! dispatcher keeps reading for the closed one
+//! (`AbstractDispatcherSingleActiveConsumer.java:267-289` and `:342-349`,
+//! `PersistentSubscription.java:994`). A read under way then writes its
+//! next position over the reset one (`OpReadEntry.java:249-251`), and its
+//! entries go out under the consumer id that the client uses again when it
+//! subscribes anew (`PersistentDispatcherSingleActiveConsumer.java:224-246`).
+//! And when the active consumer changes, Failover holds back the rewind and
+//! the new owner's notification for a second (same file, `:139-152`), while
+//! every dispatch that completes starts a read for whoever is active now,
+//! past the entries the last owner was sent (`:265`): only a flow request
+//! waits for the rewind (`:284`).
 //!
-//! The client filters neither entry. The first arrives after the
-//! re-subscribe, under the same consumer id, as does the replay of an
-//! operator's cursor reset after a seek, which must be delivered
-//! (`a_cursor_reset_after_a_seek_is_delivered` in `seek.rs`). The second
-//! follows no seek at all. Only the application knows its checkpoint, so
-//! here it processes only a message that directly follows it, and seeks
-//! again on any other.
+//! Both reach a consumer before the broker has told it, since it last
+//! subscribed, that it is the active one, and the client drops what arrives
+//! then: the broker sends it again from the checkpoint with its
+//! notification. So here one group processes every message above the
+//! checkpoint and must still process each number once and in order
+//! ([`Rule::Above`]). Without that rule in the client it missed messages in
+//! 3 of 32 runs, and with it in none of 64.
+//!
+//! The other group keeps checking that each message directly follows the
+//! checkpoint, and seeks again when one does not ([`Rule::Follows`]), which
+//! an application that must not skip messages still does: a consumer that
+//! stays connected while its partition goes to another consumer and back
+//! within the broker's delay is told nothing in between, and the entries of
+//! a read the broker started for the new owner and had under way when it
+//! rewound arrive after the notification, with the cursor moved past them
+//! (the task at `:139-152` neither cancels nor disowns that read). The
+//! client can tell neither from a regular delivery, so [`Rule::Above`]
+//! fails on the second if a run meets it. The report counts the entries
+//! [`Rule::Follows`] caught.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,11 +59,14 @@ use pulsar::{
     consumer::Message, proto::MessageIdData, Consumer, ConsumerEvent, ConsumerItem, Pulsar,
     TokioExecutor,
 };
-use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
+use tokio::{sync::oneshot, time::Instant};
 
 use crate::{
     cluster::{eventually, exclusive, index, partition, topic, Cluster},
-    delivery::{batching_producer, failover_consumer, number, publish_with, Delivered, DEADLINE},
+    delivery::{
+        batching_producer, expected_owners, failover_consumer, number, producer, publish_with,
+        Delivered, Member, DEADLINE,
+    },
 };
 
 /// How long a change of members may take to reach the broker's layout.
@@ -62,9 +79,20 @@ const ACK_EVERY: u64 = 25;
 /// before its consumer gives up, as the source then fails.
 const RESEEKS_IN_A_ROW: u32 = 3;
 
+/// What a consumer does with a message above its partition's checkpoint.
+#[derive(Clone, Copy, PartialEq)]
+enum Rule {
+    /// Processes it only if it directly follows the checkpoint, and seeks
+    /// the partition to the checkpoint again if it does not.
+    Follows,
+    /// Processes it, whatever lies between the two.
+    Above,
+}
+
 /// What the consumers of a group share, as Quickwit's pipelines share the
 /// metastore checkpoint, and what the test sees each of them do.
 struct Group {
+    rule: Rule,
     started: Instant,
     tracks: BTreeMap<String, Track>,
     processed: Delivered,
@@ -75,6 +103,8 @@ struct Group {
     ledger_rollovers: u64,
     /// Why a consumer gave up on a partition, if one did.
     gave_up: Option<String>,
+    /// Messages the client withheld from the consumers that have left.
+    withheld: u64,
 }
 
 /// What the group did with one partition.
@@ -92,14 +122,14 @@ struct Track {
 }
 
 impl Track {
-    /// What the continuity rule makes of a message at `received`.
-    fn judge(&self, received: &Position) -> Verdict {
+    /// What `rule` makes of a message at `received`.
+    fn judge(&self, received: &Position, rule: Rule) -> Verdict {
         let Some((_, last)) = &self.checkpoint else {
             return Verdict::Process;
         };
         if *received <= last.position {
             Verdict::Redelivered
-        } else if follows(&last.position, received) {
+        } else if rule == Rule::Above || follows(&last.position, received) {
             Verdict::Process
         } else {
             Verdict::Gap
@@ -108,11 +138,13 @@ impl Track {
 }
 
 enum Verdict {
-    /// Follows the checkpoint, or the partition has none yet.
+    /// What the rule processes: above the checkpoint and, under
+    /// [`Rule::Follows`], right after it; or the partition has none yet.
     Process,
     /// At or below the checkpoint, so processed already.
     Redelivered,
-    /// Above the checkpoint, with messages between the two.
+    /// Above the checkpoint, with messages between the two, under
+    /// [`Rule::Follows`].
     Gap,
 }
 
@@ -301,8 +333,9 @@ impl fmt::Display for Step {
 }
 
 impl Group {
-    fn new() -> Self {
+    fn new(rule: Rule) -> Self {
         Self {
+            rule,
             started: Instant::now(),
             tracks: BTreeMap::new(),
             processed: Delivered::default(),
@@ -310,6 +343,7 @@ impl Group {
             log: Vec::new(),
             ledger_rollovers: 0,
             gave_up: None,
+            withheld: 0,
         }
     }
 
@@ -355,8 +389,8 @@ impl Group {
         })
     }
 
-    /// Processes `message` only if it follows its partition's checkpoint,
-    /// and moves the checkpoint to it in the same step.
+    /// Processes `message` if the group's rule says so, and moves the
+    /// partition's checkpoint to it in the same step.
     fn offer(&mut self, consumer: &'static str, message: &Message<String>) -> Offer {
         let id = message.ack_id();
         let received = Mark {
@@ -366,7 +400,7 @@ impl Group {
         let partition = index(&message.topic);
         let at = self.started.elapsed();
         let track = self.tracks.entry(message.topic.clone()).or_default();
-        match track.judge(&received.position) {
+        match track.judge(&received.position, self.rule) {
             Verdict::Process => {}
             Verdict::Redelivered => {
                 track.dropped_by.push(consumer, received.number);
@@ -455,6 +489,7 @@ impl Group {
             .filter(|step| matches!(step.what, What::Gap { .. }))
             .count();
         writeln!(report, "stale entries repaired by a re-seek: {repaired}").unwrap();
+        writeln!(report, "messages the client withheld: {}", self.withheld).unwrap();
         writeln!(report, "ledger rollovers: {}", self.ledger_rollovers).unwrap();
         for change in changes {
             writeln!(report, "{change}").unwrap();
@@ -489,19 +524,10 @@ impl fmt::Display for Change {
     }
 }
 
-/// A consumer of the group and the task that drives it.
-struct Member {
-    stop: oneshot::Sender<()>,
-    task: JoinHandle<()>,
-}
-
-impl Member {
-    /// Stops driving the consumer and closes it.
-    async fn leave(self, name: &'static str, group: &Mutex<Group>) {
-        group.lock().unwrap().note(name, What::Leaving);
-        self.stop.send(()).expect("the consumer task runs");
-        self.task.await.expect("the consumer task");
-    }
+/// Stops driving the consumer `name` and closes it.
+async fn leave(name: &'static str, member: Member, group: &Mutex<Group>) {
+    group.lock().unwrap().note(name, What::Leaving);
+    member.stop(name).await;
 }
 
 /// Subscribes `name` to the group with a client of its own, as each Quickwit
@@ -514,9 +540,8 @@ async fn join(
 ) -> Member {
     group.lock().unwrap().note(name, What::Joining);
     let consumer = failover_consumer(&cluster.client().await, topic, name).await;
-    let (stop, stopped) = oneshot::channel();
-    let task = tokio::spawn(pipeline(name, consumer, group.clone(), stopped));
-    Member { stop, task }
+    let group = group.clone();
+    Member::spawn(|stop| pipeline(name, consumer, group, stop))
 }
 
 /// Drives `consumer` as a Quickwit pipeline drives its Pulsar source, until
@@ -571,8 +596,11 @@ async fn pipeline(
                 .expect("ack");
         }
     }
+    let withheld = consumer.messages_withheld();
     consumer.close().await.expect("close");
-    group.lock().unwrap().forget(name);
+    let mut group = group.lock().unwrap();
+    group.withheld += withheld;
+    group.forget(name);
 }
 
 /// Publishes rounds of ten numbered messages to every partition until
@@ -584,12 +612,7 @@ async fn publish_rounds(
 ) -> u64 {
     let mut producers = Vec::new();
     for partition in &partitions {
-        let single = pulsar
-            .producer()
-            .with_topic(partition)
-            .build()
-            .await
-            .expect("producer");
+        let single = producer(&pulsar, partition).await;
         producers.push((single, batching_producer(&pulsar, partition).await));
     }
     let mut last = 0;
@@ -613,11 +636,7 @@ async fn settle(
     members: &BTreeMap<&'static str, Member>,
 ) -> Change {
     let names: Vec<&'static str> = members.keys().copied().collect();
-    let expected: BTreeMap<String, BTreeSet<&'static str>> = partitions
-        .iter()
-        .enumerate()
-        .map(|(i, partition)| (partition.clone(), BTreeSet::from([names[i % names.len()]])))
-        .collect();
+    let expected = expected_owners(partitions, &names);
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     let (settled_at, settled) = loop {
         {
@@ -662,11 +681,23 @@ async fn settle(
 
 #[tokio::test]
 async fn consumers_that_seek_on_activation_settle() {
+    seek_on_activation(Rule::Follows).await;
+}
+
+#[tokio::test]
+async fn consumers_that_process_all_above_the_checkpoint_miss_nothing() {
+    seek_on_activation(Rule::Above).await;
+}
+
+/// Joins three consumers one at a time under load, then removes the first,
+/// and checks that ownership settles after each change and that every
+/// published number is processed exactly once and in order.
+async fn seek_on_activation(rule: Rule) {
     let cluster = exclusive().await;
     let topic = topic("failover-seek");
     cluster.create_partitioned_topic(&topic, 4).await;
     let partitions: Vec<String> = (0..4).map(|i| partition(&topic, i)).collect();
-    let group = Arc::new(Mutex::new(Group::new()));
+    let group = Arc::new(Mutex::new(Group::new(rule)));
     let stop_publishing = Arc::new(AtomicBool::new(false));
     let publishing = Instant::now();
     let publisher = tokio::spawn(publish_rounds(
@@ -694,7 +725,7 @@ async fn consumers_that_seek_on_activation_settle() {
     }
     // every partition moves
     let a = members.remove("a").expect("a joined");
-    a.leave("a", &group).await;
+    leave("a", a, &group).await;
     changes.push(settle(&group, &partitions, &members).await);
 
     stop_publishing.store(true, Ordering::Relaxed);
@@ -711,7 +742,7 @@ async fn consumers_that_seek_on_activation_settle() {
     .await;
     group.lock().unwrap().assert_going(&changes);
     for (name, member) in members {
-        member.leave(name, &group).await;
+        leave(name, member, &group).await;
     }
 
     let group = group.lock().unwrap();
@@ -719,7 +750,7 @@ async fn consumers_that_seek_on_activation_settle() {
         "published 1..={published} on each of {} partitions in {:.1}s\n{}",
         partitions.len(),
         publishing.as_secs_f64(),
-        group.report(&changes)
+        group.report(&changes),
     );
     for change in &changes {
         assert_eq!(change.quiet_events, 0, "did not stay settled: {change}");

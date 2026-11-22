@@ -109,6 +109,9 @@ pub(crate) struct Delivery {
     /// Messages the application took, and when, for the redelivery timer.
     /// Only kept when a redelivery delay is set.
     pub taken: Option<Vec<(MessageIdData, Instant)>>,
+    /// Messages the engine withheld, ever, because the broker had not said
+    /// this Failover consumer was the active one.
+    pub withheld: u64,
 }
 
 impl Delivery {

@@ -358,6 +358,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 config,
                 disc_last_message_received: None,
                 disc_messages_received: 0,
+                disc_messages_withheld: 0,
                 pending_events: VecDeque::new(),
             };
             // At build, a namespace that cannot be listed or a topic that

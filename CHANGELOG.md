@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Consumer
+
+- On a durable Failover subscription of a persistent topic, no message of
+  a topic or partition reaches the application before the broker has said
+  on the current connection that the consumer is active, so the first one
+  comes after `ConsumerEvent::BecameActive`. Every re-subscribe, a
+  reconnect or the consumer's own seek, starts over. The client drops what
+  the broker sends in between, without acknowledging it, and the broker
+  sends it again from the last acknowledged message once it says so.
+  `Consumer::messages_withheld()` counts the dropped messages.
+- The time to the first message is unchanged: about one failover delay
+  (`activeConsumerFailoverDelayTimeMillis`, 1 s by default) after a
+  subscribe, a seek or a reconnect. After its own seek the application
+  still gets no event.
+- When the broker says a second time that the consumer is active, and the
+  consumer has been handed messages since the first, the application gets
+  `BecameInactive` and then `BecameActive`: the broker rewound to the last
+  acknowledged message, so those messages come again.
+- A nack, or the unacked-message timer, sends no redelivery request while
+  the broker has not said that the consumer is active. If the client
+  withheld messages and the broker then sends nothing for one to two
+  seconds, the client asks it once to send the unacknowledged messages
+  again.
+- Exclusive, Shared and Key_Shared subscriptions, non-durable
+  subscriptions, readers, non-persistent topics and brokers that speak a
+  protocol before version 12 are unchanged.
+- At the `debug` level the consumer engine names the consumer in its
+  lines, and logs each subscribe with its connection, each withheld entry
+  with its topic and position, and how many permits it had withheld when
+  the broker says the consumer is active. The lines for each received
+  frame and each request from the application moved to `trace`.
+- An application that must not skip messages still checks that each
+  message follows the one before. The `BecameActive` docs name the two
+  cases the client cannot tell from a regular delivery.
+
 ## 7.1.0
 
 ### Consumer

@@ -17,6 +17,7 @@ use crate::{
             position, DeadLetterPolicy, Delivery, EngineEvent, EngineMessage, Queued, Resume, Seek,
             SeekReply,
         },
+        gate::{self, Gate, Told},
         options::ConsumerOptions,
     },
     error::{self, ConnectionError, ConsumerError},
@@ -66,6 +67,9 @@ pub struct ConsumerEngine<Exe: Executor> {
     /// Whether `Delivery::resume` is past waiting for the first queued message
     /// on this connection, which spares a lock per message.
     first_queued_known: bool,
+    /// Whether the broker's messages on this connection go to the
+    /// application.
+    gate: Gate,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
     event_tx: UnboundedSender<EngineEvent<Exe>>,
@@ -113,7 +117,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 matches!(delivery.resume, Resume::From(_) | Resume::After(_)),
             )
         };
-        ConsumerEngine {
+        let mut engine = ConsumerEngine {
             client,
             connection,
             topic,
@@ -130,6 +134,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             deferred_seeks: VecDeque::new(),
             time_floor: None,
             first_queued_known,
+            gate: Gate::Unguarded,
             engine_rx: Some(engine_rx),
             event_rx,
             event_tx,
@@ -141,7 +146,19 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             frame_accounted: 0,
             dead_letter_policy,
             options,
-        }
+        };
+        engine.gate = engine.new_gate();
+        engine
+    }
+
+    /// The gate of this consumer on its current connection.
+    fn new_gate(&self) -> Gate {
+        Gate::new(
+            self.sub_type,
+            &self.options,
+            &self.topic,
+            self.connection.sender().protocol_version(),
+        )
     }
 
     fn register_source<E, M>(&self, mut rx: mpsc::UnboundedReceiver<E>, mapper: M) -> Result<(), ()>
@@ -212,24 +229,31 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
             match self.event_rx.next().await {
                 Some(EngineEvent::Message(epoch, _)) if epoch != self.epoch => {
-                    debug!("consumer engine: dropped a frame from a previous connection");
+                    debug!(
+                        "consumer {}: dropped a frame from a previous connection",
+                        self.debug_format()
+                    );
                 }
                 Some(EngineEvent::Message(_, msg)) => {
-                    debug!("consumer engine: received message, {:?}", msg);
+                    trace!(
+                        "consumer {}: received message, {:?}",
+                        self.debug_format(),
+                        msg
+                    );
                     let out = self.handle_message_opt(msg).await;
                     if let Some(res) = out {
                         return res;
                     }
                 }
                 Some(EngineEvent::EngineMessage(msg)) => {
-                    debug!("consumer engine: received engine message");
+                    trace!("consumer {}: received engine message", self.debug_format());
                     let continue_loop = self.handle_ack_opt(msg).await;
                     if !continue_loop {
                         return Ok(());
                     }
                 }
                 // wakes the loop, whose top checks the connection
-                Some(EngineEvent::Tick) => {}
+                Some(EngineEvent::Tick) => self.redeliver_if_quiet().await,
                 Some(EngineEvent::RedeliveryTick) => self.redeliver_unacked().await,
                 None => {
                     log::warn!("Event stream is terminated");
@@ -249,14 +273,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 None
             }
             Some(message) => {
-                let charged = message
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.metadata.num_messages_in_batch)
-                    .unwrap_or(1)
-                    .max(1) as u32;
+                let charged = gate::charged(&message);
                 self.frame_accounted = 0;
-                match self.process_message(message).await {
+                match self.process_message(message, charged).await {
                     // Continue
                     Ok(true) => None,
                     // End of Topic
@@ -283,6 +302,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.ack(message_id, cumulative).await;
                 true
             }
+            // The broker takes redelivery requests from the active consumer
+            // only, and sends everything unacked when it names one.
+            Some(EngineMessage::Nack(_)) if self.gate.is_closed() => true,
             Some(EngineMessage::Nack(message_id)) => {
                 if let Err(e) = self
                     .connection
@@ -398,9 +420,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         })
     }
 
-    /// Process the message. Returns `true` if there are more messages to process
+    /// Process the message, on which the broker spent `charged` permits.
+    /// Returns `true` if there are more messages to process
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    async fn process_message(&mut self, message: RawMessage) -> Result<bool, Error> {
+    async fn process_message(&mut self, message: RawMessage, charged: u32) -> Result<bool, Error> {
         match message {
             RawMessage {
                 command:
@@ -425,7 +448,23 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     self.debug_format(),
                     active_consumer_change.is_active
                 );
-                self.announce(active_consumer_change.is_active.unwrap_or(false))?;
+                self.told(active_consumer_change.is_active.unwrap_or(false))
+                    .await?;
+            }
+            RawMessage {
+                command:
+                    BaseCommand {
+                        message: Some(message),
+                        ..
+                    },
+                ..
+            } if self.gate.is_closed() => {
+                self.gate.withhold(charged);
+                self.delivery.lock().unwrap().withheld += u64::from(charged);
+                debug!(
+                    "consumer engine: withheld {} {}:{}",
+                    self.topic, message.message_id.ledger_id, message.message_id.entry_id
+                );
             }
             RawMessage {
                 command:
@@ -435,6 +474,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     },
                 payload: Some(payload),
             } => {
+                self.gate.passed();
                 self.process_payload(message, payload).await?;
             }
             RawMessage {
@@ -618,7 +658,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     .is_some_and(|index| !is_set(&message.ack_set, index))
             {
                 debug!("consumer engine: skipped {message_id:?}, acked before");
-                self.frame_accounted += 1;
                 continue;
             }
             if let Some(start) = &self.start {
@@ -746,7 +785,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// BecameInactive would make an application that seeks on activation
     /// seek for ever.
     async fn reconnect_announcing(&mut self, announce: bool) -> Result<(), Error> {
-        debug!("reconnecting consumer for topic: {}", self.topic);
+        debug!("consumer {}: reconnecting", self.debug_format());
         let (mut options, rollback) = {
             let mut delivery = self.delivery.lock().unwrap();
             delivery.epoch += 1;
@@ -860,6 +899,13 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     match flow {
                         Ok(()) => {
                             self.messages_rx = Some(messages);
+                            self.gate = self.new_gate();
+                            debug!(
+                                "consumer {}: subscribed on connection {}, {:?}",
+                                self.debug_format(),
+                                self.connection.id(),
+                                self.gate
+                            );
                             return Ok(());
                         }
                         Err(e) => {
@@ -1074,6 +1120,9 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     /// acked within the redelivery delay.
     async fn redeliver_unacked(&mut self) {
         self.track_taken();
+        if self.gate.is_closed() {
+            return;
+        }
         let now = Instant::now();
         let ids: Vec<_> = self
             .unacked_messages
@@ -1233,6 +1282,52 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             .unwrap_or_default();
         for (message_id, at) in taken {
             self.unacked_messages.insert(message_id, at + delay);
+        }
+    }
+
+    /// The broker said whether this consumer is the `active` one of its
+    /// Failover subscription.
+    async fn told(&mut self, active: bool) -> Result<(), Error> {
+        match self.gate.told(active) {
+            Told::Opened { withheld } => {
+                debug!(
+                    "consumer {}: gate opened, {withheld} permits withheld",
+                    self.debug_format()
+                );
+                self.announce(true)?;
+                self.refund_permits(withheld).await;
+            }
+            // The broker rewound to the subscription's position: what this
+            // consumer was handed since it last heard so comes again, and
+            // if another consumer was active in between, the broker may
+            // have sent this one entries past those it sent the other. The
+            // application hears that it lost the partition and has it back.
+            Told::ActiveAgain { handed: true } => {
+                self.announce(false)?;
+                self.announce(true)?;
+            }
+            Told::ActiveAgain { handed: false } => {}
+            Told::Other => self.announce(active)?,
+        }
+        Ok(())
+    }
+
+    /// Asks the broker to send from the subscription's position again, once
+    /// the gate says enough ticks passed without a message.
+    async fn redeliver_if_quiet(&mut self) {
+        if !self.gate.tick() {
+            return;
+        }
+        let asked = self
+            .connection
+            .sender()
+            .send_redeliver_unacknowleged_messages(self.id, Vec::new())
+            .await;
+        if let Err(e) = asked {
+            warn!(
+                "consumer {}: could not ask for redelivery: {e}",
+                self.debug_format()
+            );
         }
     }
 

@@ -405,6 +405,18 @@ impl Cluster {
             .await;
     }
 
+    /// Creates `subscription` on `topic`, on each partition of a partitioned
+    /// one, at the end of the topic. Until a topic has a subscription, the
+    /// broker may delete its closed ledgers at any time.
+    pub async fn create_subscription(&self, topic: &str, subscription: &str) {
+        self.admin(
+            reqwest::Method::PUT,
+            &format!("{}/subscription/{subscription}", path(topic)),
+            None,
+        )
+        .await;
+    }
+
     pub async fn update_partitions(&self, topic: &str, partitions: u32) {
         self.set_partitions(reqwest::Method::POST, topic, partitions)
             .await;
