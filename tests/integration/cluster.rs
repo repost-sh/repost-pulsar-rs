@@ -36,6 +36,8 @@ const BOOKIE: &str = "rprs-bookie";
 const HOLDER: &str = "rprs-brokers-net";
 const BROKERS: [&str; 2] = ["rprs-broker-1", "rprs-broker-2"];
 pub(crate) const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
+/// Longer than a broker takes to stop gracefully.
+const DOCKER_TIMEOUT: Duration = Duration::from_secs(120);
 /// The brokers' metadata session lasts 10 s, so a dead broker's topics move
 /// well within this.
 const FAILOVER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -117,6 +119,7 @@ pub(crate) async fn ensure_network() {
 
 async fn boot() -> Cluster {
     let _ = env_logger::builder().is_test(true).try_init();
+    step("cluster: boot");
     ensure_network().await;
     let label_filter = format!("label={LABEL}");
     let existing = docker(&[
@@ -164,7 +167,21 @@ async fn boot() -> Cluster {
         "-server",
         "localhost:2181",
     ];
-    if !docker_ok(&[&shell[..], &["stat", &cluster_node]].concat()).await {
+    // The shell retries an unreachable server for ever, and any failure other
+    // than a missing node must not format a live cluster.
+    let stat = docker_output(&[&shell[..], &["stat", &cluster_node]].concat())
+        .await
+        .expect("run docker");
+    let registered = stat.status.success();
+    if !registered {
+        let stderr = String::from_utf8_lossy(&stat.stderr);
+        assert!(
+            stderr.contains("Node does not exist"),
+            "stat {cluster_node}: {stderr}"
+        );
+    }
+    step(format!("cluster: registered {registered}"));
+    if !registered {
         docker(&[
             "run",
             "--rm",
@@ -261,9 +278,11 @@ async fn boot() -> Cluster {
         .await;
     }
 
+    step("cluster: containers up");
     for broker in 0..BROKERS.len() {
         wait_healthy(broker).await;
     }
+    step("cluster: brokers healthy");
     Cluster {
         down: [false; 2],
         frozen: [false; 2],
@@ -784,6 +803,27 @@ async fn wait_healthy(broker: usize) {
     );
 }
 
+/// Writes `what` to stderr at once, stamped with the brokers' clock (UTC), so
+/// that a run that stops shows how far it got and lines up with the brokers'
+/// logs.
+pub fn step(what: impl std::fmt::Display) {
+    eprintln!("{} {what}", chrono::Utc::now().format("%H:%M:%S%.3fZ"));
+}
+
+/// Awaits `future`, and fails the test with `what` if it takes longer than
+/// `limit`. The future goes on the heap: a test's own future lives on its
+/// thread's stack.
+pub async fn within<T>(
+    limit: Duration,
+    what: impl std::fmt::Display,
+    future: impl Future<Output = T>,
+) -> T {
+    match tokio::time::timeout(limit, Box::pin(future)).await {
+        Ok(output) => output,
+        Err(_) => panic!("{what}: not within {limit:?}"),
+    }
+}
+
 /// Polls `check` every half second until it holds. Returns false if it still
 /// does not hold after `timeout`.
 pub(crate) async fn eventually<F, Fut>(timeout: Duration, mut check: F) -> bool
@@ -818,21 +858,35 @@ pub(crate) fn http() -> reqwest::Client {
     HTTP.with(Clone::clone)
 }
 
-pub(crate) async fn docker_ok<S: AsRef<OsStr>>(args: &[S]) -> bool {
-    Command::new("docker")
+/// Runs the docker CLI, killing it after a time limit: when the Docker VM
+/// stalls, a call can wait for ever. `docker run` may pull the image first.
+async fn docker_output<S: AsRef<OsStr>>(args: &[S]) -> std::io::Result<std::process::Output> {
+    let limit = if args.first().is_some_and(|arg| arg.as_ref() == "run") {
+        BOOT_TIMEOUT
+    } else {
+        DOCKER_TIMEOUT
+    };
+    let output = Command::new("docker")
         .args(args)
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success())
+        .kill_on_drop(true)
+        .output();
+    within(limit, format!("docker {}", joined(args)), output).await
+}
+
+fn joined<S: AsRef<OsStr>>(args: &[S]) -> String {
+    args.iter()
+        .map(|a| a.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) async fn docker_ok<S: AsRef<OsStr>>(args: &[S]) -> bool {
+    docker_output(args).await.is_ok_and(|o| o.status.success())
 }
 
 /// The last lines a container wrote. Pulsar logs to both streams.
 pub(crate) async fn docker_logs(name: &str) -> String {
-    match Command::new("docker")
-        .args(["logs", "--tail", "40", name])
-        .output()
-        .await
-    {
+    match docker_output(&["logs", "--tail", "40", name]).await {
         Ok(o) => format!(
             "{}{}",
             String::from_utf8_lossy(&o.stdout),
@@ -845,18 +899,11 @@ pub(crate) async fn docker_logs(name: &str) -> String {
 /// Runs the docker CLI without blocking the test's runtime, so a client under
 /// test keeps running while a broker stops. Returns stdout.
 async fn docker<S: AsRef<OsStr>>(args: &[S]) -> String {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .await
-        .expect("run docker");
+    let output = docker_output(args).await.expect("run docker");
     assert!(
         output.status.success(),
         "docker {}: {}",
-        args.iter()
-            .map(|a| a.as_ref().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" "),
+        joined(args),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
