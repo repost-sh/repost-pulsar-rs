@@ -126,7 +126,10 @@ async fn a_failed_topic_reports_its_error_and_the_rest_carry_on() {
         .await
         .expect("an error within the deadline");
     match failure {
-        Some(Err(e)) => assert!(e.to_string().contains(&gone), "{e}"),
+        Some(Err(e)) => {
+            assert!(e.to_string().contains(&gone), "{e}");
+            assert!(e.is_final(), "{e:?}");
+        }
         other => panic!("expected an error, got {other:?}"),
     }
     publish(&pulsar, &kept, 3..=4).await;

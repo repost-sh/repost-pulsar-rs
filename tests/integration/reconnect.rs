@@ -205,8 +205,8 @@ async fn a_consumer_reports_a_deleted_topic_and_ends() {
         .await
         .expect("an error within the deadline");
     assert!(
-        matches!(failure, Some(Err(_))),
-        "expected an error, got {failure:?}"
+        matches!(&failure, Some(Err(e)) if e.is_final()),
+        "expected the error that ends the consumer, got {failure:?}"
     );
     let end = tokio::time::timeout(DEADLINE, consumer.next())
         .await
@@ -427,7 +427,8 @@ async fn a_consumer_refused_on_reconnect_comes_back_once_allowed() {
         match tokio::time::timeout(Duration::from_secs(3), consumer.next()).await {
             Ok(Some(Ok(message))) => delivered.record(&message),
             // the refusal, told once
-            Ok(Some(Err(_))) | Err(_) => {}
+            Ok(Some(Err(e))) => assert!(!e.is_final(), "{e:?}"),
+            Err(_) => {}
             Ok(None) => panic!("the consumer ended on a refusal"),
         }
     }

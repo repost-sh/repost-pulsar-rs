@@ -147,6 +147,15 @@ impl Error {
         }
     }
 
+    /// Whether a consumer or producer that already exists ends on this error:
+    /// the broker says its topic is deleted or terminated, or fenced the
+    /// producer. A consumer hands the error to the application and ends that
+    /// topic or partition for good, [`ConsumerError::Topic`] naming it; a
+    /// consumer or reader of several reads the others on.
+    pub fn is_final(&self) -> bool {
+        self.server_error().is_some_and(ends_after_creation)
+    }
+
     /// Whether someone has to act for the client to get through: a credential
     /// that the broker refused, or that the auth provider failed to make, or
     /// a refusal by authorization or policy.

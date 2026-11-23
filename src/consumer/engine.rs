@@ -20,7 +20,7 @@ use crate::{
         gate::{self, Gate, Told},
         options::ConsumerOptions,
     },
-    error::{self, ConnectionError, ConsumerError},
+    error::{ConnectionError, ConsumerError},
     message::{
         proto::{command_subscribe::SubType, MessageIdData},
         Message as RawMessage,
@@ -937,7 +937,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     }
                 }
                 // Java retries everything but a deleted topic.
-                Err(e) if e.server_error().is_some_and(error::ends_after_creation) => {
+                Err(e) if e.is_final() => {
                     error!(
                         "consumer {}: cannot subscribe again: {e}",
                         self.debug_format()

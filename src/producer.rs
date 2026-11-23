@@ -1479,8 +1479,7 @@ impl<Exe: Executor> ProducerConnection<Exe> {
 
 /// Errors after which re-creating the producer cannot succeed.
 fn ends_producer(error: &Error) -> bool {
-    matches!(error, Error::Producer(ProducerError::Closed))
-        || error.server_error().is_some_and(error::ends_after_creation)
+    matches!(error, Error::Producer(ProducerError::Closed)) || error.is_final()
 }
 
 impl<Exe: Executor> std::ops::Drop for TopicProducer<Exe> {
