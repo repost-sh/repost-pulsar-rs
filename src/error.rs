@@ -273,28 +273,26 @@ impl ConnectionError {
 
     /// Errors in how the client is set up, which no retry fixes.
     fn is_configuration_error(&self) -> bool {
-        if let ConnectionError::Io(e) = self {
-            return matches!(
+        match self {
+            ConnectionError::Io(e) => matches!(
                 e.kind(),
                 io::ErrorKind::InvalidInput
                     | io::ErrorKind::InvalidData
                     | io::ErrorKind::PermissionDenied
                     | io::ErrorKind::Unsupported
-            );
-        }
-        #[cfg(all(
-            any(
-                feature = "tokio-rustls-runtime-aws-lc-rs",
-                feature = "tokio-rustls-runtime-ring",
-                feature = "async-std-rustls-runtime-aws-lc-rs",
-                feature = "async-std-rustls-runtime-ring",
             ),
-            not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
-        ))]
-        if matches!(self, ConnectionError::DnsName(_)) {
-            return true;
+            #[cfg(all(
+                any(
+                    feature = "tokio-rustls-runtime-aws-lc-rs",
+                    feature = "tokio-rustls-runtime-ring",
+                    feature = "async-std-rustls-runtime-aws-lc-rs",
+                    feature = "async-std-rustls-runtime-ring",
+                ),
+                not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+            ))]
+            ConnectionError::DnsName(_) => true,
+            _ => false,
         }
-        false
     }
 
     /// Whether the broker refused the credential, or the auth provider failed
