@@ -1,5 +1,12 @@
 # Changelog
 
+## 7.3.1
+
+- No change in behaviour. `ConnectionError`'s test for a configuration
+  error is one match, which clippy 1.100 accepts; 7.3.0's lint job failed
+  on it. This is the first release whose commit passed the fork's CI on
+  GitHub.
+
 ## 7.3.0
 
 ### Reader
