@@ -3,7 +3,11 @@
 
 use std::{ops::RangeInclusive, time::Duration};
 
-use pulsar::{proto::MessageIdData, reader::Reader, ConsumerOptions, Pulsar, TokioExecutor};
+use pulsar::{
+    proto::{command_subscribe::SubType, MessageIdData},
+    reader::Reader,
+    ConsumerOptions, Pulsar, TokioExecutor,
+};
 
 use crate::{
     cluster::{exclusive, partition, topic},
@@ -388,4 +392,29 @@ async fn a_reader_seeking_by_time_gets_nothing_published_before() {
     let mut delivered = Delivered::default();
     collect(&mut reader, &mut delivered, 5, DEADLINE).await;
     delivered.assert_exactly(&topic, 6..=10);
+}
+
+// A reader's subscription is exclusive whatever type the builder was given:
+// a second reader under the same name is refused.
+#[tokio::test]
+async fn a_reader_subscribes_exclusive_whatever_type_it_was_given() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-exclusive");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    let reader = |sub_type| {
+        pulsar
+            .reader()
+            .with_topic(&topic)
+            .with_subscription("reader")
+            .with_subscription_type(sub_type)
+            .into_reader::<String>()
+    };
+
+    let first = reader(SubType::Shared).await.expect("reader");
+    assert_eq!(first.sub_type(), SubType::Exclusive);
+    assert!(
+        reader(SubType::Exclusive).await.is_err(),
+        "a second reader took the same exclusive subscription"
+    );
 }

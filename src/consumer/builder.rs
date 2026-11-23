@@ -408,18 +408,19 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 "a reader starts at a message id or a rollback, not both".to_string(),
             ));
         }
-        // would this clone() consume too much memory?
-        let mut validated = self.clone().validate().await?;
-        validated.config.auto_ack = true;
-
         // Internally, the reader interface is implemented as a consumer using an exclusive,
         // non-durable subscription
+        let mut builder = self.clone();
+        if let Some(sub_type) = builder
+            .subscription_type
+            .filter(|t| *t != SubType::Exclusive)
+        {
+            warn!("a reader's subscription is `Exclusive`, not `{sub_type:?}`");
+        }
+        builder.subscription_type = Some(SubType::Exclusive);
+        let mut validated = builder.validate().await?;
+        validated.config.auto_ack = true;
         validated.config.options.durable = Some(false);
-
-        // the validate() function defaults sub_type to SubType::Shared,
-        // but a reader's subscription is exclusive
-        warn!("Subscription Type for a reader is `Exclusive`. Resetting.");
-        validated.config.sub_type = SubType::Exclusive;
 
         // An id belongs to one partition; Java hands it to every one.
         if validated.config.options.start_message_id.is_some()
