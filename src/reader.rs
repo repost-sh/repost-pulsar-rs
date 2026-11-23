@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, pin::Pin};
 use chrono::{DateTime, Utc};
 use futures::{
     task::{Context, Poll},
-    Stream,
+    Future, Stream,
 };
 use url::Url;
 
@@ -179,6 +179,16 @@ impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn has_message_available(&mut self) -> Result<bool, Error> {
         self.consumer.has_message_available().await
+    }
+
+    /// Whether each partition holds a message this reader has not read yet,
+    /// as [`Consumer::messages_available`] answers it: by a future that
+    /// borrows nothing of the reader, to await while reading on.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn messages_available(
+        &self,
+    ) -> impl Future<Output = Result<BTreeMap<String, bool>, Error>> + Send + 'static {
+        self.consumer.messages_available()
     }
 
     /// returns the current number of messages received

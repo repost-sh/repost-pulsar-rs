@@ -11,7 +11,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use futures::{
     channel::{mpsc, oneshot},
-    FutureExt, SinkExt, Stream,
+    Future, FutureExt, SinkExt, Stream,
 };
 
 use crate::{
@@ -146,18 +146,23 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         self.topic.clone()
     }
 
+    /// The connection the consumer's engine holds, asked for now. The answer
+    /// borrows nothing of the consumer.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn connection(&mut self) -> Result<Arc<Connection<Exe>>, Error> {
+    pub fn connection(
+        &self,
+    ) -> impl Future<Output = Result<Arc<Connection<Exe>>, Error>> + Send + 'static {
         let (resolver, response) = oneshot::channel();
-        self.engine_tx
-            .send(EngineMessage::GetConnection(resolver))
-            .await
-            .map_err(|_| ConsumerError::Connection(ConnectionError::Disconnected))?;
-
-        response.await.map_err(|oneshot::Canceled| {
-            error!("the consumer engine dropped the request");
-            ConnectionError::Disconnected.into()
-        })
+        let asked = self
+            .engine_tx
+            .unbounded_send(EngineMessage::GetConnection(resolver));
+        async move {
+            asked.map_err(|_| ConsumerError::Connection(ConnectionError::Disconnected))?;
+            response.await.map_err(|oneshot::Canceled| {
+                error!("the consumer engine dropped the request");
+                ConnectionError::Disconnected.into()
+            })
+        }
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -285,36 +290,28 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     // Java: ConsumerImpl.hasMessageAvailableAsync and hasMoreMessages
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn has_message_available(&mut self) -> Result<bool, Error> {
-        let resume = self.delivery.lock().unwrap().resume.clone();
-        let response = self.last_message_id_response().await?;
-        let last = response.last_message_id;
-        // The broker sends Java's longs: an empty topic answers entry -1.
-        if (last.entry_id as i64) < 0 {
-            return Ok(false);
+        Ok(self.last_message().await?.is_left())
+    }
+
+    /// The topic's last message, asked of the broker once this is awaited.
+    /// The answer borrows nothing of the consumer, so the application can
+    /// await it while it takes messages.
+    pub(super) fn last_message(
+        &self,
+    ) -> impl Future<Output = Result<LastMessage, Error>> + Send + 'static {
+        let consumer_id = self.consumer_id;
+        let delivery = self.delivery.clone();
+        let connection = self.connection();
+        async move {
+            let connection = connection.await?;
+            let response = connection.sender().get_last_message_id(consumer_id).await?;
+            Ok(LastMessage { response, delivery })
         }
-        Ok(match (&resume, response.consumer_mark_delete_position) {
-            (Resume::After(taken), _) => position(&last) > position(taken),
-            (Resume::From(first), _) => position(&last) >= position(first),
-            // -1 is "before the first entry"
-            (_, Some(cursor)) => {
-                (last.ledger_id as i64, last.entry_id as i64)
-                    > (cursor.ledger_id as i64, cursor.entry_id as i64)
-            }
-            (_, None) => true,
-        })
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn get_last_message_id(&mut self) -> Result<MessageIdData, Error> {
-        Ok(self.last_message_id_response().await?.last_message_id)
-    }
-
-    async fn last_message_id_response(
-        &mut self,
-    ) -> Result<proto::CommandGetLastMessageIdResponse, Error> {
-        let consumer_id = self.consumer_id;
-        let connection = self.connection().await?;
-        Ok(connection.sender().get_last_message_id(consumer_id).await?)
+        Ok(self.last_message().await?.response.last_message_id)
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -355,6 +352,37 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         let conn = self.connection().await?;
         let schema_response = conn.sender().get_schema(&self.topic, version).await?;
         Ok(schema_response.schema)
+    }
+}
+
+/// The last message a broker holds of a topic, and where the application is
+/// in that topic.
+pub(super) struct LastMessage {
+    response: proto::CommandGetLastMessageIdResponse,
+    delivery: Arc<Mutex<Delivery>>,
+}
+
+impl LastMessage {
+    /// Whether it is a message the application has not taken yet, where the
+    /// application is when this is called: past the last one it took, or at
+    /// the first one queued, or else past the subscription's position.
+    pub(super) fn is_left(&self) -> bool {
+        let last = &self.response.last_message_id;
+        // The broker sends Java's longs: an empty topic answers entry -1.
+        if (last.entry_id as i64) < 0 {
+            return false;
+        }
+        let resume = self.delivery.lock().unwrap().resume.clone();
+        match (&resume, &self.response.consumer_mark_delete_position) {
+            (Resume::After(taken), _) => position(last) > position(taken),
+            (Resume::From(first), _) => position(last) >= position(first),
+            // -1 is "before the first entry"
+            (_, Some(cursor)) => {
+                (last.ledger_id as i64, last.entry_id as i64)
+                    > (cursor.ledger_id as i64, cursor.entry_id as i64)
+            }
+            (_, None) => true,
+        }
     }
 }
 

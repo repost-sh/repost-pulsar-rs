@@ -10,9 +10,9 @@ use pulsar::{
 };
 
 use crate::{
-    cluster::{exclusive, partition, topic},
+    cluster::{exclusive, partition, topic, within, Cluster},
     delivery::{
-        available, collect, earliest_reader, publish, publish_batched, reader_with, take,
+        available, collect, earliest_reader, next, publish, publish_batched, reader_with, take,
         Delivered, DEADLINE,
     },
 };
@@ -417,4 +417,93 @@ async fn a_reader_subscribes_exclusive_whatever_type_it_was_given() {
         reader(SubType::Exclusive).await.is_err(),
         "a second reader took the same exclusive subscription"
     );
+}
+
+#[tokio::test]
+async fn a_reader_tells_which_partitions_hold_a_message_left() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-available-partitions");
+    cluster.create_partitioned_topic(&topic, 2).await;
+    let partitions = [partition(&topic, 0), partition(&topic, 1)];
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &partitions[0], 1..=2).await;
+    let mut reader = earliest_reader(&pulsar, &topic, "reader").await;
+    let left = |first: bool, second: bool| {
+        [
+            (partitions[0].clone(), first),
+            (partitions[1].clone(), second),
+        ]
+        .into_iter()
+        .collect()
+    };
+
+    assert_eq!(partitions_left(&reader).await, left(true, false));
+    take(&mut reader, &mut Delivered::default(), 2).await;
+    assert_eq!(partitions_left(&reader).await, left(false, false));
+    publish(&pulsar, &partitions[1], 1..=1).await;
+    assert_eq!(partitions_left(&reader).await, left(false, true));
+}
+
+/// Which partitions hold a message `reader` has not read, answered within
+/// [`DEADLINE`].
+async fn partitions_left(
+    reader: &Reader<String, TokioExecutor>,
+) -> std::collections::BTreeMap<String, bool> {
+    within(
+        DEADLINE,
+        "the partitions' answers",
+        reader.messages_available(),
+    )
+    .await
+    .expect("messages_available")
+}
+
+// The answer borrows nothing of the reader: while a frozen broker keeps it
+// waiting, the application reads the partitions of the other broker on.
+#[tokio::test]
+async fn a_frozen_broker_holds_the_answer_and_not_the_other_partitions() {
+    let mut cluster = exclusive().await;
+    let (topic, frozen) = topic_on_both_brokers(&cluster).await;
+    let (stuck, live) = (partition(&topic, 0), partition(&topic, 1));
+    let pulsar = cluster.client_via(1 - frozen).await;
+    let mut reader = earliest_reader(&pulsar, &topic, "reader").await;
+    publish(&pulsar, &live, 1..=1).await;
+    take(&mut reader, &mut Delivered::default(), 1).await;
+
+    cluster.pause_broker(frozen).await;
+    let mut answer = Box::pin(reader.messages_available());
+    publish(&pulsar, &live, 2..=3).await;
+    let mut delivered = Delivered::default();
+    for _ in 0..2 {
+        tokio::select! {
+            _ = next(&mut reader, &mut delivered) => {}
+            early = &mut answer => panic!("the frozen broker answered: {early:?}"),
+        }
+    }
+    delivered.assert_exactly(&live, 2..=3);
+
+    // back before its session expires, the broker answers what it was asked
+    cluster.resume_broker(frozen).await;
+    let left = within(DEADLINE, "the answer once the broker runs on", answer)
+        .await
+        .expect("messages_available");
+    assert_eq!(left.get(&stuck), Some(&false), "{left:?}");
+    assert_eq!(left.get(&live), Some(&false), "{left:?}");
+}
+
+/// A topic of two partitions, the first owned by the broker returned and the
+/// second by the other one. Two partitions in one bundle move together, so
+/// this tries new names until a pair splits.
+async fn topic_on_both_brokers(cluster: &Cluster) -> (String, usize) {
+    for _ in 0..16 {
+        let topic = topic("reader-two-brokers");
+        cluster.create_partitioned_topic(&topic, 2).await;
+        let (first, second) = (partition(&topic, 0), partition(&topic, 1));
+        let owner = cluster.owner(&first).await;
+        cluster.move_to(&second, 1 - owner).await;
+        if cluster.owner(&first).await == owner {
+            return (topic, owner);
+        }
+    }
+    panic!("no topic with its two partitions on different brokers");
 }

@@ -34,7 +34,7 @@ use data::Seek;
 use futures::{
     future::try_join_all,
     task::{Context, Poll},
-    Stream,
+    Future, Stream,
 };
 pub use initial_position::InitialPosition;
 pub use message::{ConsumerEvent, ConsumerItem, Message};
@@ -264,7 +264,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     /// The consumer of `topic`, named as [`Consumer::seek_to`] takes it.
     fn topic_consumer(&mut self, topic: &str) -> Result<&mut TopicConsumer<T, Exe>, Error> {
         let topic = full_topic_name(topic);
-        self.topic_consumers()
+        self.topic_consumers_mut()
             .into_iter()
             .find(|c| full_topic_name(&c.topic()) == topic)
             .ok_or_else(|| {
@@ -282,7 +282,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         // Every seek runs to its end: one that failed must not cancel the
         // others halfway, leaving their partitions moved or not.
         futures::future::join_all(
-            self.topic_consumers()
+            self.topic_consumers_mut()
                 .into_iter()
                 .map(|c| c.seek(None, Some(publish_time_ms))),
         )
@@ -313,7 +313,7 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn last_message_ids(&mut self) -> Result<BTreeMap<String, MessageIdData>, Error> {
         let ids =
-            try_join_all(self.topic_consumers().into_iter().map(|c| async move {
+            try_join_all(self.topic_consumers_mut().into_iter().map(|c| async move {
                 Ok::<_, Error>((c.topic(), c.get_last_message_id().await?))
             }))
             .await?;
@@ -361,17 +361,51 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
     // Java: MultiTopicsConsumerImpl.hasMessageAvailableAsync
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn has_message_available(&mut self) -> Result<bool, Error> {
-        let answers = try_join_all(
-            self.topic_consumers()
+        let available = self.messages_available().await?;
+        Ok(available.into_values().any(|available| available))
+    }
+
+    /// Whether each topic or partition holds a message the application has
+    /// not taken yet, keyed by the name this consumer reads it under.
+    ///
+    /// The answer is a future that borrows nothing of the consumer: the
+    /// application can await it while it takes messages, so a broker that is
+    /// slow to answer delays the answer and not the messages. Awaited, it
+    /// asks every broker for its last message, and compares each with what
+    /// the application has taken once all have answered: a message published
+    /// before the question and taken before the answer is not left. The
+    /// answer fails as a whole when one topic or partition cannot be asked,
+    /// as while its consumer is reconnecting.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn messages_available(
+        &self,
+    ) -> impl Future<Output = Result<BTreeMap<String, bool>, Error>> + Send + 'static {
+        let asked: Vec<_> = self
+            .topic_consumers()
+            .into_iter()
+            .map(|consumer| {
+                let (topic, last) = (consumer.topic(), consumer.last_message());
+                async move { Ok::<_, Error>((topic, last.await?)) }
+            })
+            .collect();
+        async move {
+            let answered = try_join_all(asked).await?;
+            Ok(answered
                 .into_iter()
-                .map(|consumer| consumer.has_message_available()),
-        )
-        .await?;
-        Ok(answers.into_iter().any(|available| available))
+                .map(|(topic, last)| (topic, last.is_left()))
+                .collect())
+        }
     }
 
     /// The consumer of each topic or partition this consumer reads.
-    fn topic_consumers(&mut self) -> Vec<&mut TopicConsumer<T, Exe>> {
+    fn topic_consumers(&self) -> Vec<&TopicConsumer<T, Exe>> {
+        match &self.inner {
+            InnerConsumer::Single(c) => vec![c],
+            InnerConsumer::Multi(c) => c.consumers.values().map(|c| &**c).collect(),
+        }
+    }
+
+    fn topic_consumers_mut(&mut self) -> Vec<&mut TopicConsumer<T, Exe>> {
         match &mut self.inner {
             InnerConsumer::Single(c) => vec![c],
             InnerConsumer::Multi(c) => c.consumers.values_mut().map(|c| &mut **c).collect(),
