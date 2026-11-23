@@ -614,6 +614,64 @@ pub mod proto {
         }
     }
 
+    /// Stands for a credential in a `Debug` rendering.
+    struct Redacted;
+
+    impl std::fmt::Debug for Redacted {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("<redacted>")
+        }
+    }
+
+    // The Debug of the two messages that carry the credential, without it:
+    // no log of a frame shows a token, whichever line prints it. Each names
+    // every field, so one the protocol adds does not compile until it is
+    // placed here.
+    impl std::fmt::Debug for CommandConnect {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self {
+                client_version,
+                auth_method,
+                auth_method_name,
+                auth_data,
+                protocol_version,
+                proxy_to_broker_url,
+                original_principal,
+                original_auth_data,
+                original_auth_method,
+                feature_flags,
+            } = self;
+            f.debug_struct("CommandConnect")
+                .field("client_version", client_version)
+                .field("auth_method", auth_method)
+                .field("auth_method_name", auth_method_name)
+                .field("auth_data", &auth_data.as_ref().map(|_| Redacted))
+                .field("protocol_version", protocol_version)
+                .field("proxy_to_broker_url", proxy_to_broker_url)
+                .field("original_principal", original_principal)
+                .field(
+                    "original_auth_data",
+                    &original_auth_data.as_ref().map(|_| Redacted),
+                )
+                .field("original_auth_method", original_auth_method)
+                .field("feature_flags", feature_flags)
+                .finish()
+        }
+    }
+
+    impl std::fmt::Debug for AuthData {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self {
+                auth_method_name,
+                auth_data,
+            } = self;
+            f.debug_struct("AuthData")
+                .field("auth_method_name", auth_method_name)
+                .field("auth_data", &auth_data.as_ref().map(|_| Redacted))
+                .finish()
+        }
+    }
+
     pub fn client_version() -> String {
         format!("{}-v{}", "pulsar-rs", env!("CARGO_PKG_VERSION"))
     }
@@ -639,12 +697,36 @@ mod tests {
     use tokio_util::codec::{Decoder, Encoder};
 
     use crate::{
-        connection::RequestKey,
+        connection::{messages, Authentication, RequestKey},
         message::{
             proto::{BaseCommand, CommandSendError, ServerError},
             Codec, Message,
         },
     };
+
+    #[test]
+    fn no_debug_of_a_frame_shows_the_credential() {
+        let token = || Authentication {
+            name: "token".to_string(),
+            data: b"a-secret-token".to_vec(),
+        };
+        let shown = format!(
+            "{:?} {:?}",
+            messages::connect(Some(token()), None),
+            messages::auth_challenge(token())
+        );
+
+        // neither as text nor as the bytes a Vec<u8> prints
+        let bytes = format!("{:?}", token().data);
+        assert!(!shown.contains("a-secret-token"), "{shown}");
+        assert!(!shown.contains(bytes.trim_matches(['[', ']'])), "{shown}");
+        assert_eq!(shown.matches("<redacted>").count(), 2, "{shown}");
+        // the rest of the frame is still there to read
+        assert!(
+            shown.contains("auth_method_name: Some(\"token\")"),
+            "{shown}"
+        );
+    }
 
     #[test]
     fn send_persistence_error_is_handled_as_producer_close() {
