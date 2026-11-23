@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Reader
+
+- A reader acknowledges cumulatively, once a second, up to the last message
+  the application took, where it acknowledged every message on its own as
+  it was taken: one ack a second for a topic or partition, however many
+  messages it reads. The broker's backlog of the reader's subscription
+  follows it within that second, and an entry counts until the reader has
+  taken all of its messages. A reconnect or a seek drops the ack still
+  owed, since the subscription starts again after what was taken.
+- A reader no longer warns about its subscription type on every build: it
+  asks for `Exclusive` itself, and warns only when the application set
+  another type.
+
+### Consumer
+
+- `Consumer::messages_available()` and `Reader::messages_available()` say
+  for each topic or partition whether it holds a message the application
+  has not taken yet, keyed by the name it is read under. The answer is a
+  future that borrows nothing of the consumer, so the application can
+  await it while it takes messages: a message published before the
+  question and taken before the answer is not left.
+  `has_message_available()` is the same answer as one flag.
+- `Error::is_final()` says whether an error ended the consumer or producer
+  it came from: the broker says its topic is deleted or terminated, or
+  fenced the producer. A consumer or reader of several topics or partitions
+  hands the error over, drops that one for good and reads the others on;
+  an application that needs every partition can now tell that error from
+  the ones the consumer carries on after.
+
+### Connections, auth and retries
+
+- The `Debug` rendering of a connect command and of auth data shows
+  `<redacted>` in place of the credential. At the `trace` level the client
+  logged both frames as they were, with the token's bytes.
+
 ## 7.2.0
 
 ### Consumer
