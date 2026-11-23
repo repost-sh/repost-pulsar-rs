@@ -112,6 +112,12 @@ pub(crate) struct Delivery {
     /// Messages the engine withheld, ever, because the broker had not said
     /// this Failover consumer was the active one.
     pub withheld: u64,
+    /// The last message a reader's application took that the engine has not
+    /// acknowledged yet, with the size of its batch. The engine acknowledges
+    /// up to it on its next tick. A reconnect drops it: the new subscription
+    /// starts after what was taken, and an ack sent after a seek would move
+    /// the subscription past the seek's target.
+    pub unacked_taken: Option<MessageIdData>,
 }
 
 impl Delivery {
@@ -139,10 +145,12 @@ impl Delivery {
         (self.freed >= self.refill).then(|| std::mem::take(&mut self.freed))
     }
 
-    /// A reconnect began: what the old connection freed is void.
+    /// A reconnect began: what the old connection freed is void, and so is
+    /// what was to be acknowledged on it.
     pub fn reconnecting(&mut self) {
         self.freed = 0;
         self.granting = true;
+        self.unacked_taken = None;
     }
 
     /// The permits a reconnect grants: the window, less the stale messages
@@ -172,6 +180,18 @@ pub(crate) enum EngineMessage<Exe: Executor> {
 pub struct MessageData {
     pub id: MessageIdData,
     pub batch_size: Option<i32>,
+}
+
+impl MessageData {
+    /// The id to ack the message by: its id with the size of its batch, so
+    /// an ack covers this member of a batch only.
+    // Java: BatchMessageIdImpl carries batchSize
+    pub(crate) fn ack_id(&self) -> MessageIdData {
+        MessageIdData {
+            batch_size: self.batch_size,
+            ..self.id.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -253,7 +253,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     }
                 }
                 // wakes the loop, whose top checks the connection
-                Some(EngineEvent::Tick) => self.redeliver_if_quiet().await,
+                Some(EngineEvent::Tick) => {
+                    self.ack_taken().await;
+                    self.redeliver_if_quiet().await;
+                }
                 Some(EngineEvent::RedeliveryTick) => self.redeliver_unacked().await,
                 None => {
                     log::warn!("Event stream is terminated");
@@ -1310,6 +1313,20 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             Told::Other => self.announce(active)?,
         }
         Ok(())
+    }
+
+    /// Acknowledges what a reader's application took since the last tick, up
+    /// to the last message: one cumulative ack a second for a topic or
+    /// partition, however many messages it read. The broker's backlog of
+    /// the reader's subscription follows it within that second.
+    // Java: ReaderImpl acknowledges each message cumulatively, and
+    // PersistentAcknowledgmentsGroupingTracker sends the last one of each
+    // interval
+    async fn ack_taken(&mut self) {
+        let taken = self.delivery.lock().unwrap().unacked_taken.take();
+        if let Some(message_id) = taken {
+            self.ack(message_id, true).await;
+        }
     }
 
     /// Asks the broker to send from the subscription's position again, once

@@ -4,6 +4,7 @@
 use std::{ops::RangeInclusive, time::Duration};
 
 use pulsar::{
+    consumer::InitialPosition,
     proto::{command_subscribe::SubType, MessageIdData},
     reader::Reader,
     ConsumerOptions, Pulsar, TokioExecutor,
@@ -506,4 +507,65 @@ async fn topic_on_both_brokers(cluster: &Cluster) -> (String, usize) {
         }
     }
     panic!("no topic with its two partitions on different brokers");
+}
+
+// A reader acknowledges cumulatively, once a second, so the broker's backlog
+// of its subscription follows what it read: an entry counts until the reader
+// has taken all of it.
+#[tokio::test]
+async fn a_readers_backlog_follows_what_it_read() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-acks");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &topic, 1..=6).await;
+    publish_batched(&pulsar, &topic, 7..=26).await;
+    let mut reader = earliest_reader(&pulsar, &topic, "reader").await;
+    let backlog = |entries: u64| {
+        let (cluster, topic) = (&cluster, &topic);
+        async move {
+            cluster
+                .wait_subscription(topic, "reader", |s| s.msg_backlog == entries)
+                .await;
+        }
+    };
+
+    // six single messages and two batches of ten
+    backlog(8).await;
+    take(&mut reader, &mut Delivered::default(), 4).await;
+    backlog(4).await;
+    // into the second batch: the first one is read whole
+    take(&mut reader, &mut Delivered::default(), 15).await;
+    backlog(1).await;
+    take(&mut reader, &mut Delivered::default(), 7).await;
+    backlog(0).await;
+}
+
+// The ack a reader owes for what it read is dropped by a seek: sent after
+// it, the ack would move the subscription past the seek's target. With a
+// window of two the broker still holds most of what the seek brings back
+// when the next tick comes.
+#[tokio::test]
+async fn a_seek_right_after_reading_is_not_passed_by_the_readers_ack() {
+    let cluster = exclusive().await;
+    let topic = topic("reader-acks-seek");
+    cluster.create_topic(&topic).await;
+    let pulsar = cluster.client().await;
+    publish(&pulsar, &topic, 1..=10).await;
+    let options = ConsumerOptions::default()
+        .with_initial_position(InitialPosition::Earliest)
+        .with_receiver_queue_size(2);
+    let mut reader = reader_with(&pulsar, &topic, "reader", options).await;
+    let taken = take(&mut reader, &mut Delivered::default(), 10).await;
+
+    reader
+        .seek(Some(taken[2].message_id().clone()), None)
+        .await
+        .expect("seek");
+    // past the engine's next tick, with nothing taken meanwhile
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut delivered = Delivered::default();
+    collect(&mut reader, &mut delivered, 7, DEADLINE).await;
+    delivered.assert_exactly(&topic, 4..=10);
 }

@@ -16,8 +16,9 @@ use crate::{
 };
 
 /// Reads a topic, or every partition of a partitioned topic, from a start
-/// position, through a non-durable subscription. It acknowledges each message
-/// as the application takes it.
+/// position, through a non-durable subscription. Once a second it
+/// acknowledges what the application took, up to the last message, so the
+/// broker's backlog of the subscription follows the reader.
 ///
 /// On a partitioned topic, partitions added later are found at each topic
 /// refresh (30 s by default) and read from their beginning. A partition whose

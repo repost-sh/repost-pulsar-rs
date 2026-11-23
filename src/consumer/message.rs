@@ -121,12 +121,8 @@ impl<T> Message<T> {
     /// like: [`message_id`](Self::message_id) with the size of its batch, so
     /// an ack covers this member of a batch only. `message_id` leaves the
     /// size out, so that it equals the ids the broker reports.
-    // Java: BatchMessageIdImpl carries batchSize
     pub fn ack_id(&self) -> MessageIdData {
-        MessageIdData {
-            batch_size: self.message_id.batch_size,
-            ..self.message_id.id.clone()
-        }
+        self.message_id.ack_id()
     }
 
     /// Get message key (partition key string as stored in metadata)

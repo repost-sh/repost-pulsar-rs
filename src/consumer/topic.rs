@@ -336,15 +336,6 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn create_message(&self, message_id: MessageIdData, payload: Payload) -> Message<T> {
-        let message_id = MessageData {
-            id: message_id,
-            batch_size: payload.metadata.num_messages_in_batch,
-        };
-        Message::new(&self.topic, message_id, payload)
-    }
-
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub(crate) async fn get_schema(
         &mut self,
         version: Option<Vec<u8>>,
@@ -412,6 +403,10 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                     return Poll::Ready(Some(Ok(ConsumerItem::Event(event))));
                 }
                 Poll::Ready(Some(Ok(Queued::Message(epoch, id, payload)))) => {
+                    let message_id = MessageData {
+                        id,
+                        batch_size: payload.metadata.num_messages_in_batch,
+                    };
                     // C++: lib/ConsumerImpl.cc:1162 receiveHelper drops messages
                     // that arrived on an earlier connection.
                     let flow = {
@@ -428,9 +423,12 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                             }
                             continue;
                         }
-                        delivery.resume = Resume::After(id.clone());
+                        delivery.resume = Resume::After(message_id.id.clone());
+                        if self.config.auto_ack {
+                            delivery.unacked_taken = Some(message_id.ack_id());
+                        }
                         if let Some(taken) = &mut delivery.taken {
-                            taken.push((id.clone(), std::time::Instant::now()));
+                            taken.push((message_id.id.clone(), std::time::Instant::now()));
                         }
                         // Java: ConsumerImpl.java:2253 messageProcessed
                         delivery.free_permit()
@@ -442,14 +440,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
                     }
                     self.last_message_received = Some(Utc::now());
                     self.messages_received += 1;
-                    let message = self.create_message(id, payload);
-                    if self.config.auto_ack {
-                        // If the engine is gone, nothing can be acked; what is
-                        // still queued drains, and then the stream ends.
-                        let _ = self
-                            .engine_tx
-                            .unbounded_send(EngineMessage::Ack(message.ack_id(), false));
-                    }
+                    let message = Message::new(&self.topic, message_id, payload);
                     return Poll::Ready(Some(Ok(ConsumerItem::Message(message))));
                 }
                 Poll::Ready(Some(Err(e))) => {
