@@ -1,5 +1,34 @@
 # Changelog
 
+## 7.3.2
+
+### OAuth2
+
+- A `file:` credentials URL is read at its file path, so a file whose
+  path holds a space, a `%` or another character the URL percent-encodes
+  is found; 7.3.1 looked for the encoded path. On Unix, a file URL that
+  names no local file, such as one with a remote host, fails with an
+  error that names the URL. On Windows a remote host is read as a UNC
+  path.
+- The discovery and token requests follow no redirect. The token request
+  carries the client secret in its body, which 7.3.1 sent on to the
+  target of a 307 or 308 from the token endpoint. A redirect now fails
+  the request.
+- The error of a failed token request no longer holds the token
+  endpoint's answer, which on a 200 that did not parse included the
+  access token's bytes. It says what failed: the server's error code and
+  description, the request with its causes, or the kind and position of
+  the parse error. Whether it is retriable is unchanged.
+- A credentials file or `data:` URL that does not parse fails with the
+  kind and position of the parse error. 7.3.1 gave serde_json's message,
+  which quotes a client secret that is not a string.
+- The `Debug` of the client credentials shows `<redacted>` for the client
+  secret.
+- The `Display` and `Debug` of `OAuth2Params`, and the errors of an
+  invalid `data:` credentials URL, show a `data:` URL, which holds the
+  client secret, as its scheme alone. The client logs that `Display` at
+  the `debug` level for each token it gets.
+
 ## 7.3.1
 
 - No change in behaviour. `ConnectionError`'s test for a configuration
