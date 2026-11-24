@@ -50,7 +50,7 @@ impl std::fmt::Debug for OAuth2PrivateParams {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct OAuth2Params {
     pub issuer_url: String,
     pub credentials_url: String,
@@ -64,8 +64,31 @@ impl Display for OAuth2Params {
         write!(
             f,
             "OAuth2Params({}, {}, {:?}, {:?})",
-            self.issuer_url, self.credentials_url, self.audience, self.scope
+            self.issuer_url,
+            self.credentials_hint(),
+            self.audience,
+            self.scope
         )
+    }
+}
+
+// Shows the credentials URL as credentials_hint does: a data: URL holds the
+// client secret.
+// Names every field, so one added here does not compile until it is placed.
+impl std::fmt::Debug for OAuth2Params {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            issuer_url,
+            credentials_url: _,
+            audience,
+            scope,
+        } = self;
+        f.debug_struct("OAuth2Params")
+            .field("issuer_url", issuer_url)
+            .field("credentials_url", &self.credentials_hint())
+            .field("audience", audience)
+            .field("scope", scope)
+            .finish()
     }
 }
 
@@ -122,19 +145,21 @@ impl OAuth2Authentication {
             token: None,
         })
     }
+}
 
+impl OAuth2Params {
+    /// The credentials URL to show: a file URL whole, or only the scheme of
+    /// any other URL, since a data: URL holds the client secret itself.
     fn credentials_hint(&self) -> String {
-        match Url::parse(self.params.credentials_url.as_str()) {
+        match Url::parse(self.credentials_url.as_str()) {
             Ok(url) => match url.scheme() {
-                "file" => format!("file:{}", url.path()),
+                "file" => url.into(),
                 scheme => format!("{scheme}:<redacted>"),
             },
             Err(_) => String::from("<invalid credentials_url>"),
         }
     }
-}
 
-impl OAuth2Params {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn read_private_params(&self) -> Result<OAuth2PrivateParams, Box<dyn std::error::Error>> {
         let credentials_url = Url::parse(self.credentials_url.as_str())?;
@@ -148,30 +173,17 @@ impl OAuth2Params {
             "data" => {
                 let data_url = match DataUrl::process(self.credentials_url.as_str()) {
                     Ok(data_url) => data_url,
-                    Err(err) => {
-                        return Err(Box::from(format!(
-                            "invalid data url [{}]: {:?}",
-                            self.credentials_url.as_str(),
-                            err
-                        )));
-                    }
+                    Err(err) => return Err(Box::from(format!("invalid data url: {err}"))),
                 };
                 let body = match data_url.decode_to_vec() {
                     Ok((body, _)) => body,
-                    Err(err) => {
-                        return Err(Box::from(format!(
-                            "invalid data url [{}]: {:?}",
-                            self.credentials_url.as_str(),
-                            err
-                        )));
-                    }
+                    Err(err) => return Err(Box::from(format!("invalid data url: {err}"))),
                 };
 
                 Ok(serde_json::from_slice(&body)?)
             }
-            _ => Err(Box::from(format!(
-                "invalid credential url [{}]",
-                self.credentials_url.as_str()
+            scheme => Err(Box::from(format!(
+                "unsupported credentials url scheme [{scheme}]"
             ))),
         }
     }
@@ -191,7 +203,7 @@ impl Authentication for OAuth2Authentication {
             Err(e) => {
                 return Err(AuthenticationError::Custom(format!(
                     "failed to read OAuth2 credentials from {}: {e}",
-                    self.credentials_hint()
+                    self.params.credentials_hint()
                 )));
             }
         }
@@ -555,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn no_rendering_of_the_params_shows_inline_credentials() {
+        let params = OAuth2Params {
+            issuer_url: "http://issuer.example".to_string(),
+            credentials_url:
+                r#"data:application/json,{"client_id":"id","client_secret":"a-client-secret"}"#
+                    .to_string(),
+            audience: None,
+            scope: None,
+        };
+
+        let shown = format!("{params} {params:?}");
+
+        assert!(!shown.contains("a-client-secret"), "{shown}");
+        assert!(shown.contains("http://issuer.example"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_data_url_error_does_not_show_its_content() {
+        let mut auth = OAuth2Authentication::client_credentials(OAuth2Params {
+            issuer_url: "http://issuer.example".to_string(),
+            credentials_url: "data:application/json;base64,a-client-secret".to_string(),
+            audience: None,
+            scope: None,
+        });
+
+        let error = auth.initialize().await.unwrap_err();
+
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains("a-client-secret"), "{shown}");
+        assert!(shown.contains("invalid data url"), "{shown}");
+    }
+
+    #[test]
     fn debug_of_the_private_params_does_not_show_the_secret() {
         let private_params = OAuth2PrivateParams {
             client_id: "client-id".to_string(),
@@ -568,5 +613,27 @@ mod tests {
         assert!(!shown.contains("a-client-secret"), "{shown}");
         assert!(shown.contains("client_secret: <redacted>"), "{shown}");
         assert!(shown.contains("client_id: \"client-id\""), "{shown}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_url_with_a_host_is_shown_whole() {
+        let params = OAuth2Params {
+            issuer_url: "http://issuer.example".to_string(),
+            credentials_url: "file://remote-host/credentials.json".to_string(),
+            audience: None,
+            scope: None,
+        };
+        let mut auth = OAuth2Authentication::client_credentials(params.clone());
+
+        let error = auth.initialize().await.unwrap_err();
+
+        for shown in [params.to_string(), format!("{params:?}"), error.to_string()] {
+            assert!(
+                shown.contains("file://remote-host/credentials.json"),
+                "{shown}"
+            );
+            assert!(!shown.contains("file:/credentials.json"), "{shown}");
+        }
     }
 }
