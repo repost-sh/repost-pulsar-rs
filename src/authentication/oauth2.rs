@@ -120,7 +120,9 @@ impl OAuth2Params {
         let credentials_url = Url::parse(self.credentials_url.as_str())?;
         match credentials_url.scheme() {
             "file" => {
-                let path = credentials_url.path();
+                let path = credentials_url.to_file_path().map_err(|()| {
+                    format!("credentials url [{credentials_url}] names no local file")
+                })?;
                 Ok(serde_json::from_str(fs::read_to_string(path)?.as_str())?)
             }
             "data" => {
@@ -308,6 +310,7 @@ impl OAuth2Authentication {
 #[cfg(test)]
 mod tests {
     use oauth2::TokenUrl;
+    use url::Url;
 
     use crate::{
         authentication::{
@@ -373,5 +376,46 @@ mod tests {
             token: None,
         };
         assert_retriable_error(auth.auth_data().await.unwrap_err());
+    }
+
+    #[test]
+    fn reads_a_credentials_file_whose_path_needs_percent_encoding() {
+        let dir = std::env::temp_dir().join(format!("oauth2 100% {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("credentials.json");
+        std::fs::write(
+            &file,
+            r#"{"client_id":"client-id","client_secret":"client-secret"}"#,
+        )
+        .unwrap();
+        let params = OAuth2Params {
+            issuer_url: "".to_string(),
+            credentials_url: Url::from_file_path(&file).unwrap().into(),
+            audience: None,
+            scope: None,
+        };
+
+        let read = params.read_private_params().map_err(|e| e.to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(read.unwrap().client_id, "client-id");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_url_without_a_local_path_is_named_in_the_error() {
+        let params = OAuth2Params {
+            issuer_url: "".to_string(),
+            credentials_url: "file://remote-host/credentials.json".to_string(),
+            audience: None,
+            scope: None,
+        };
+
+        let error = params.read_private_params().unwrap_err().to_string();
+
+        assert!(
+            error.contains("[file://remote-host/credentials.json]"),
+            "{error}"
+        );
     }
 }
