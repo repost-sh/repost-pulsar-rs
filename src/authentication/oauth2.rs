@@ -17,10 +17,46 @@ use oauth2::{
     AuthUrl, ClientId, ClientSecret, RequestTokenError, Scope, TokenResponse, TokenUrl,
 };
 use openidconnect::{core::CoreProviderMetadata, IssuerUrl};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use url::Url;
 
 use crate::{authentication::Authentication, error::AuthenticationError, message::proto::Redacted};
+
+/// A failure to parse JSON that holds a secret, the credentials or a token
+/// answer, kept to its kind and position: serde_json's own message quotes the
+/// value it rejected, which can be the secret.
+#[derive(Debug)]
+struct SecretJsonError {
+    category: serde_json::error::Category,
+    line: usize,
+    column: usize,
+}
+
+impl From<serde_json::Error> for SecretJsonError {
+    fn from(error: serde_json::Error) -> Self {
+        SecretJsonError {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+}
+
+impl Display for SecretJsonError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} error at line {} column {}",
+            self.category, self.line, self.column
+        )
+    }
+}
+
+impl std::error::Error for SecretJsonError {}
+
+fn parse_secret_json<T: DeserializeOwned>(json: &[u8]) -> Result<T, SecretJsonError> {
+    Ok(serde_json::from_slice(json)?)
+}
 
 #[derive(Deserialize, Clone)]
 struct OAuth2PrivateParams {
@@ -168,7 +204,7 @@ impl OAuth2Params {
                 let path = credentials_url.to_file_path().map_err(|()| {
                     format!("credentials url [{credentials_url}] names no local file")
                 })?;
-                Ok(serde_json::from_str(fs::read_to_string(path)?.as_str())?)
+                Ok(parse_secret_json(&fs::read(path)?)?)
             }
             "data" => {
                 let data_url = match DataUrl::process(self.credentials_url.as_str()) {
@@ -180,7 +216,7 @@ impl OAuth2Params {
                     Err(err) => return Err(Box::from(format!("invalid data url: {err}"))),
                 };
 
-                Ok(serde_json::from_slice(&body)?)
+                Ok(parse_secret_json(&body)?)
             }
             scheme => Err(Box::from(format!(
                 "unsupported credentials url scheme [{scheme}]"
@@ -342,15 +378,10 @@ impl OAuth2Authentication {
                     }
                     AuthenticationError::Retriable(message)
                 }
-                RequestTokenError::Parse(error, _body) => {
-                    let error = error.inner();
-                    AuthenticationError::Retriable(format!(
-                        "{context}: the answer could not be parsed: {:?} error at line {} column {}",
-                        error.classify(),
-                        error.line(),
-                        error.column()
-                    ))
-                }
+                RequestTokenError::Parse(error, _body) => AuthenticationError::Retriable(format!(
+                    "{context}: the answer could not be parsed: {}",
+                    SecretJsonError::from(error.into_inner())
+                )),
                 RequestTokenError::Other(message) => {
                     AuthenticationError::Retriable(format!("{context}: {message}"))
                 }
@@ -635,5 +666,49 @@ mod tests {
             );
             assert!(!shown.contains("file:/credentials.json"), "{shown}");
         }
+    }
+
+    /// The error of initialize() with a credentials file that holds `json`.
+    async fn initialize_error_for_a_credentials_file(json: &str) -> AuthenticationError {
+        let dir = std::env::temp_dir().join(format!("oauth2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("credentials.json");
+        std::fs::write(&file, json).unwrap();
+        let mut auth = OAuth2Authentication::client_credentials(OAuth2Params {
+            issuer_url: "http://issuer.example".to_string(),
+            credentials_url: Url::from_file_path(&file).unwrap().into(),
+            audience: None,
+            scope: None,
+        });
+
+        let error = auth.initialize().await.unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn a_numeric_client_secret_is_not_shown_in_the_parse_error() {
+        let error = initialize_error_for_a_credentials_file(
+            r#"{"client_id":"id","client_secret":83749201}"#,
+        )
+        .await;
+
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains("83749201"), "{shown}");
+        assert!(!shown.contains("invalid type"), "{shown}");
+        assert!(shown.contains("line 1 column"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_boolean_client_secret_is_not_shown_in_the_parse_error() {
+        let error =
+            initialize_error_for_a_credentials_file(r#"{"client_id":"id","client_secret":true}"#)
+                .await;
+
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains("`true`"), "{shown}");
+        assert!(!shown.contains("boolean"), "{shown}");
+        assert!(!shown.contains("invalid type"), "{shown}");
+        assert!(shown.contains("line 1 column"), "{shown}");
     }
 }
