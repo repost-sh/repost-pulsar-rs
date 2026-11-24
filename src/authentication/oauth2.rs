@@ -1,6 +1,7 @@
 //! OAuth2 Authenticator
 
 use std::{
+    error::Error as _,
     fmt::{Display, Formatter},
     fs,
     time::Instant,
@@ -292,14 +293,36 @@ impl OAuth2Authentication {
 
         let client = reqwest::Client::new();
         let token = request.request_async(&client).await.map_err(|e| {
-            let error_message = format!(
-                "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?}): {e:?}",
+            let context = format!(
+                "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?})",
                 self.params.issuer_url, self.params.audience, self.params.scope
             );
-            if let RequestTokenError::ServerResponse(_) = e {
-                AuthenticationError::Custom(error_message)
-            } else {
-                AuthenticationError::Retriable(error_message)
+            // No arm prints the answer's body: on a 200 it holds the access token.
+            match e {
+                RequestTokenError::ServerResponse(response) => AuthenticationError::Custom(
+                    format!("{context}: the server answered with an error: {response}"),
+                ),
+                RequestTokenError::Request(error) => {
+                    let mut message = format!("{context}: the request failed: {error}");
+                    let mut cause = error.source();
+                    while let Some(source) = cause {
+                        message.push_str(&format!(": {source}"));
+                        cause = source.source();
+                    }
+                    AuthenticationError::Retriable(message)
+                }
+                RequestTokenError::Parse(error, _body) => {
+                    let error = error.inner();
+                    AuthenticationError::Retriable(format!(
+                        "{context}: the answer could not be parsed: {:?} error at line {} column {}",
+                        error.classify(),
+                        error.line(),
+                        error.column()
+                    ))
+                }
+                RequestTokenError::Other(message) => {
+                    AuthenticationError::Retriable(format!("{context}: {message}"))
+                }
             }
         })?;
         debug!("Got a new oauth2 token for [{}]", self.params);
@@ -309,7 +332,13 @@ impl OAuth2Authentication {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use oauth2::TokenUrl;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use url::Url;
 
     use crate::{
@@ -416,6 +445,93 @@ mod tests {
         assert!(
             error.contains("[file://remote-host/credentials.json]"),
             "{error}"
+        );
+    }
+
+    /// Answers one HTTP request on a local port with `head`, a status line
+    /// and any headers, followed by `body`.
+    async fn serve_one_answer(head: &str, body: &str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let answer = format!(
+            "{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert_ne!(read, 0, "the client hung up without a request");
+            stream.write_all(answer.as_bytes()).await.unwrap();
+            // read on until the client hangs up, so no unread request bytes reset the connection
+            while stream.read(&mut request).await.unwrap() > 0 {}
+        });
+        address
+    }
+
+    /// The error of a first token request to a token endpoint that answers
+    /// with `head` and `body`.
+    async fn token_request_error(head: &str, body: &str) -> AuthenticationError {
+        let address = serve_one_answer(head, body).await;
+        let mut auth = OAuth2Authentication {
+            params: OAuth2Params {
+                issuer_url: "http://issuer.example".to_string(),
+                credentials_url: "data:,".to_string(),
+                audience: None,
+                scope: None,
+            },
+            private_params: Some(OAuth2PrivateParams {
+                client_id: "id".to_string(),
+                client_secret: "secret".to_string(),
+                client_email: None,
+                issuer_url: None,
+            }),
+            token_url: Some(TokenUrl::new(format!("http://{address}/token")).unwrap()),
+            token: None,
+        };
+        auth.auth_data().await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_token_endpoint_error_does_not_show_the_answer() {
+        const MARKER: &str = "an-access-token-marker";
+        // a 200 whose body is no token response: expires_in is not a number
+        let body =
+            format!(r#"{{"access_token":"{MARKER}","token_type":"bearer","expires_in":"soon"}}"#);
+
+        let error =
+            token_request_error("HTTP/1.1 200 OK\r\nContent-Type: application/json", &body).await;
+
+        let shown = format!("{error} {error:?}");
+        let bytes = format!("{:?}", MARKER.as_bytes());
+        assert!(!shown.contains(MARKER), "{shown}");
+        assert!(!shown.contains(bytes.trim_matches(['[', ']'])), "{shown}");
+        assert!(shown.contains("could not be parsed"), "{shown}");
+        assert!(
+            matches!(error, AuthenticationError::Retriable(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_endpoint_that_rejects_the_client_is_not_retried() {
+        let error = token_request_error(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json",
+            r#"{"error":"invalid_client"}"#,
+        )
+        .await;
+
+        assert!(matches!(error, AuthenticationError::Custom(_)), "{error:?}");
+        assert!(error.to_string().contains("invalid_client"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_token_endpoint_error_without_a_body_is_retried() {
+        let error = token_request_error("HTTP/1.1 503 Service Unavailable", "").await;
+
+        assert!(
+            matches!(error, AuthenticationError::Retriable(_)),
+            "{error:?}"
         );
     }
 }
