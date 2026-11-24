@@ -20,15 +20,34 @@ use openidconnect::{core::CoreProviderMetadata, IssuerUrl};
 use serde::Deserialize;
 use url::Url;
 
-use crate::{authentication::Authentication, error::AuthenticationError};
+use crate::{authentication::Authentication, error::AuthenticationError, message::proto::Redacted};
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Clone)]
 struct OAuth2PrivateParams {
     client_id: String,
     client_secret: String,
     #[allow(dead_code)]
     client_email: Option<String>,
     issuer_url: Option<String>,
+}
+
+// Without the client secret. Names every field, so one added here does not
+// compile until it is placed.
+impl std::fmt::Debug for OAuth2PrivateParams {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            client_email,
+            issuer_url,
+        } = self;
+        f.debug_struct("OAuth2PrivateParams")
+            .field("client_id", client_id)
+            .field("client_secret", &Redacted)
+            .field("client_email", client_email)
+            .field("issuer_url", issuer_url)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -533,5 +552,21 @@ mod tests {
             matches!(error, AuthenticationError::Retriable(_)),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn debug_of_the_private_params_does_not_show_the_secret() {
+        let private_params = OAuth2PrivateParams {
+            client_id: "client-id".to_string(),
+            client_secret: "a-client-secret".to_string(),
+            client_email: None,
+            issuer_url: None,
+        };
+
+        let shown = format!("{private_params:?}");
+
+        assert!(!shown.contains("a-client-secret"), "{shown}");
+        assert!(shown.contains("client_secret: <redacted>"), "{shown}");
+        assert!(shown.contains("client_id: \"client-id\""), "{shown}");
     }
 }
