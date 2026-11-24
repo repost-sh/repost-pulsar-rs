@@ -300,13 +300,24 @@ impl Authentication for OAuth2Authentication {
     }
 }
 
+/// The HTTP client of the discovery and token requests. It follows no
+/// redirect: the token request carries the client secret in its body, which a
+/// redirect would send on to its target, and the token endpoint is the one
+/// the discovery document names, so that document has to come from the
+/// issuer's own URL.
+fn issuer_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 impl OAuth2Authentication {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn token_url(&mut self) -> Result<TokenUrl, Box<dyn std::error::Error>> {
         match &self.token_url {
             Some(url) => Ok(url.clone()),
             None => {
-                let client = reqwest::Client::new();
+                let client = issuer_http_client()?;
                 let metadata = CoreProviderMetadata::discover_async(
                     IssuerUrl::from_url(Url::parse(self.params.issuer_url.as_str())?),
                     &client,
@@ -358,7 +369,7 @@ impl OAuth2Authentication {
             request = request.add_scope(Scope::new(scope.clone()));
         }
 
-        let client = reqwest::Client::new();
+        let client = issuer_http_client()?;
         let token = request.request_async(&client).await.map_err(|e| {
             let context = format!(
                 "token endpoint request failed for issuer [{}] (audience={:?}, scope={:?})",
@@ -394,7 +405,7 @@ impl OAuth2Authentication {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, sync::mpsc};
 
     use oauth2::TokenUrl;
     use tokio::{
@@ -710,5 +721,89 @@ mod tests {
         assert!(!shown.contains("boolean"), "{shown}");
         assert!(!shown.contains("invalid type"), "{shown}");
         assert!(shown.contains("line 1 column"), "{shown}");
+    }
+
+    /// A local listener that records each request it receives and answers
+    /// it with a 404.
+    async fn recording_listener() -> (SocketAddr, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, received) = mpsc::channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                sender
+                    .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, received)
+    }
+
+    #[tokio::test]
+    async fn the_token_request_follows_no_redirect() {
+        let (target, received) = recording_listener().await;
+        let token_endpoint = serve_one_answer(
+            &format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/token"),
+            "",
+        )
+        .await;
+        let mut auth = OAuth2Authentication {
+            params: OAuth2Params {
+                issuer_url: "http://issuer.example".to_string(),
+                credentials_url: "data:,".to_string(),
+                audience: None,
+                scope: None,
+            },
+            private_params: Some(OAuth2PrivateParams {
+                client_id: "id".to_string(),
+                client_secret: "a-client-secret".to_string(),
+                client_email: None,
+                issuer_url: None,
+            }),
+            token_url: Some(TokenUrl::new(format!("http://{token_endpoint}/token")).unwrap()),
+            token: None,
+        };
+
+        auth.auth_data().await.unwrap_err();
+
+        let resent = received.try_recv();
+        assert!(resent.is_err(), "the redirect target received {resent:?}");
+    }
+
+    #[tokio::test]
+    async fn discovery_follows_no_redirect() {
+        let (target, received) = recording_listener().await;
+        let issuer = serve_one_answer(
+            &format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/.well-known/openid-configuration"
+            ),
+            "",
+        )
+        .await;
+        let mut auth = OAuth2Authentication::client_credentials(OAuth2Params {
+            issuer_url: format!("http://{issuer}"),
+            credentials_url:
+                r#"data:application/json,{"client_id":"id","client_secret":"a-client-secret"}"#
+                    .to_string(),
+            audience: None,
+            scope: None,
+        });
+
+        auth.initialize().await.unwrap_err();
+
+        let followed = received.try_recv();
+        assert!(
+            followed.is_err(),
+            "the redirect target received {followed:?}"
+        );
     }
 }
